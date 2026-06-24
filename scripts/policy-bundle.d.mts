@@ -1,0 +1,45 @@
+// Type declarations for policy-bundle.mjs — signed policy bundle (Ed25519).
+// Hand-written to pair with the plain-ESM source.
+
+export const POLICY_BUNDLE_SCHEMA: 'vaibot/policy-bundle@1'
+
+export interface PolicyBody {
+  /** Tool names / patterns always blocked — the un-overridable safety floor. */
+  denylist?: string[]
+  /** Optional overrides for the classifier rule tables. */
+  classifierTables?: Record<string, unknown>
+}
+
+export interface PolicyBundle {
+  schema: string
+  version: string
+  issuer: string
+  issuedAt: string
+  expiresAt: string
+  policy: PolicyBody
+  signature?: string
+}
+
+export interface VerifyResult {
+  ok: boolean
+  reason: string
+  policy: PolicyBody | null
+}
+
+export interface LoadResult extends VerifyResult {
+  bundle: PolicyBundle | null
+}
+
+export interface EffectivePolicy {
+  source: 'bundle' | 'builtin'
+  denylist: string[]
+  classifierTables?: Record<string, unknown>
+}
+
+export function canonicalPayload(bundle: Partial<PolicyBundle>): string
+export function computeBundleHash(bundle: Partial<PolicyBundle>): string
+export function generateKeyPair(): { publicKey: string; privateKey: string }
+export function signBundle(bundleWithoutSig: Omit<PolicyBundle, 'signature'>, privateKeyPem: string): PolicyBundle
+export function verifyBundle(bundle: PolicyBundle, publicKeyPem: string, opts?: { now?: number }): VerifyResult
+export function loadPolicyBundle(args: { path: string; publicKeyPem: string; now?: number }): LoadResult
+export function effectivePolicy(loadResult: VerifyResult | LoadResult | null): EffectivePolicy
