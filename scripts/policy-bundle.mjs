@@ -131,9 +131,11 @@ export function loadPolicyBundle(args = {}) {
 
 /**
  * Resolve the effective policy from a verify/load result. On a verified
- * bundle, returns its denylist + classifier-table overrides. On any failure,
- * returns the safe BUILT-IN baseline (empty denylist; the classifier uses its
- * own conservative default tables) — never relaxing enforcement.
+ * bundle, returns its denylist + denyTokens + classifier-table overrides. On
+ * any failure, returns the safe BUILT-IN baseline (empty denials; the
+ * classifier uses its own conservative default tables) — never relaxing
+ * enforcement. denyTokens are word-boundary command-family denials (the guard
+ * unions them onto its local denyTokens — additive, tighten-only).
  */
 export function effectivePolicy(loadResult) {
   if (loadResult && loadResult.ok && loadResult.policy) {
@@ -141,8 +143,9 @@ export function effectivePolicy(loadResult) {
     return {
       source: 'bundle',
       denylist: Array.isArray(p.denylist) ? p.denylist : [],
+      denyTokens: Array.isArray(p.denyTokens) ? p.denyTokens : [],
       classifierTables: p.classifierTables ?? undefined,
     }
   }
-  return { source: 'builtin', denylist: [], classifierTables: undefined }
+  return { source: 'builtin', denylist: [], denyTokens: [], classifierTables: undefined }
 }

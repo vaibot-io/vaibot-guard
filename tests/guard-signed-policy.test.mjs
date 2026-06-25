@@ -108,6 +108,35 @@ test("signed denylist denies a denylisted tool; classifier coexists; non-listed 
   assert.equal(allowed.data.decision.decision, "allow");
 });
 
+test("a signed denyToken blocks a command family by word boundary (C: grown bundle schema)", async () => {
+  const bundlePath = path.join(tmpRoot, "denytokens.bundle.json");
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(signBundle(makeUnsigned({ policy: { denylist: [], denyTokens: ["curl"] } }), privateKey)),
+  );
+  const post = await startGuard({ bundlePath, publicKeyPem: publicKey });
+
+  // `curl <anything>` is denied by the signed token, not just an exact "curl".
+  const denied = await post("/v1/decide/tool", {
+    sessionId: "s3",
+    toolName: "bash",
+    params: { command: "curl https://evil.example.com" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(denied.status, 200);
+  assert.equal(denied.data.decision.decision, "deny");
+  assert.match(denied.data.decision.reason, /Denied token: curl/);
+
+  // Word boundary, not substring: "curldown" must NOT trip the "curl" token.
+  const notTripped = await post("/v1/decide/tool", {
+    sessionId: "s3",
+    toolName: "bash",
+    params: { command: "echo curldown" },
+    workspaceDir: tmpRoot,
+  });
+  assert.doesNotMatch(notTripped.data.decision.reason || "", /Denied token/);
+});
+
 test("a tampered bundle fails closed — signed denylist is ignored, posture not relaxed", async () => {
   // Sign a real bundle, then mutate the policy after signing so the signature
   // no longer matches. The guard must reject it and fall back to built-ins.

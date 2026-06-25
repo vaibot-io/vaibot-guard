@@ -4,8 +4,10 @@
 export const POLICY_BUNDLE_SCHEMA: 'vaibot/policy-bundle@1'
 
 export interface PolicyBody {
-  /** Tool names / patterns always blocked — the un-overridable safety floor. */
+  /** Tool names / exact command words always blocked — the un-overridable safety floor. */
   denylist?: string[]
+  /** Word-boundary tokens denied anywhere in a command (e.g. "curl" blocks `curl …`). */
+  denyTokens?: string[]
   /** Optional overrides for the classifier rule tables. */
   classifierTables?: Record<string, unknown>
 }
@@ -33,6 +35,7 @@ export interface LoadResult extends VerifyResult {
 export interface EffectivePolicy {
   source: 'bundle' | 'builtin'
   denylist: string[]
+  denyTokens: string[]
   classifierTables?: Record<string, unknown>
 }
 

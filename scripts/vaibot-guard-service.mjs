@@ -118,12 +118,14 @@ function classifierTablesAreSafe(tables) {
 let POLICY_BUNDLE;     // last loadPolicyBundle()-shaped result { ok, reason, policy, bundle }
 let SIGNED_POLICY;     // effectivePolicy(POLICY_BUNDLE)
 let SIGNED_DENYLIST;   // SIGNED_POLICY.denylist
+let SIGNED_DENYTOKENS; // SIGNED_POLICY.denyTokens — word-boundary command-family denials
 let CLASSIFIER_TABLES; // SIGNED_POLICY.classifierTables, after the G-163 safety gate
 
 function applyLoadedBundle(loadResult) {
   POLICY_BUNDLE = loadResult;
   SIGNED_POLICY = effectivePolicy(POLICY_BUNDLE);
   SIGNED_DENYLIST = SIGNED_POLICY.denylist;
+  SIGNED_DENYTOKENS = Array.isArray(SIGNED_POLICY.denyTokens) ? SIGNED_POLICY.denyTokens : [];
   let tables = SIGNED_POLICY.classifierTables;
   if (tables && !classifierTablesAreSafe(tables)) {
     console.error("[vaibot-guard] signed policy classifier tables would relax a protected verb to safe — rejected; using built-in defaults (fail-closed).");
@@ -437,7 +439,18 @@ function readBody(req) {
 // ---- Policy (loaded at startup; restart service to apply policy changes)
 
 function matchToken(tokens, joined) {
-  return tokens.find((t) => new RegExp(`\\b${t}\\b`, "i").test(joined));
+  // Tokens are literal words (local + signed denyTokens). Escape regex metachars
+  // so a signed token can never inject a pattern or throw on an invalid regex;
+  // skip empty tokens (an empty `\b\b` would match everything → fail-open).
+  return tokens.find((t) => {
+    const esc = String(t).replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+    if (!esc) return false;
+    try {
+      return new RegExp(`\\b${esc}\\b`, "i").test(joined);
+    } catch {
+      return false;
+    }
+  });
 }
 
 // (policy helpers moved below: isDomainAllowlisted / isDeniedPath)
@@ -610,7 +623,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
   }
 
   // ---- Token posture
-  const deny = matchToken(DENY_TOKENS, joined);
+  const deny = matchToken([...DENY_TOKENS, ...(SIGNED_DENYTOKENS || [])], joined);
   if (deny) return { decision: "deny", reason: `Denied token: ${deny}` };
 
   // ---- Network posture
@@ -734,7 +747,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   if (cls.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${cls.reasons[0] || "dangerous"}` };
 
   // Token posture (applies across all tools)
-  const deny = matchToken(DENY_TOKENS, joined);
+  const deny = matchToken([...DENY_TOKENS, ...(SIGNED_DENYTOKENS || [])], joined);
   if (deny) return { decision: "deny", reason: `Denied token: ${deny}` };
 
   const approve = matchToken(APPROVE_TOKENS, joined);
