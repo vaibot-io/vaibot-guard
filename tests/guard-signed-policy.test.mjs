@@ -34,7 +34,7 @@ function makeUnsigned(overrides = {}) {
 
 const servers = [];
 
-async function startGuard({ bundlePath, publicKeyPem }) {
+async function startGuard({ bundlePath, publicKeyPem, policyPath }) {
   const port = 41200 + Math.floor(Math.random() * 2000);
   const token = "signed-policy-token";
   const logDir = path.join(tmpRoot, `.guard-${port}`);
@@ -44,7 +44,7 @@ async function startGuard({ bundlePath, publicKeyPem }) {
     VAIBOT_GUARD_HOST: "127.0.0.1",
     VAIBOT_GUARD_PORT: String(port),
     VAIBOT_GUARD_TOKEN: token,
-    VAIBOT_POLICY_PATH: POLICY_PATH,
+    VAIBOT_POLICY_PATH: policyPath || POLICY_PATH,
     VAIBOT_WORKSPACE: tmpRoot,
     VAIBOT_GUARD_LOG_DIR: logDir,
     VAIBOT_PROVE_MODE: "off",
@@ -204,6 +204,59 @@ test("a tampered bundle fails closed — signed denylist is ignored, posture not
     workspaceDir: tmpRoot,
   });
   assert.equal(stillDenied.data.decision.decision, "deny");
+});
+
+test("fail-closed: unknown command/tool escalates to approval; missing name denies; safe still allows", async () => {
+  const bundlePath = path.join(tmpRoot, "failclosed.bundle.json");
+  fs.writeFileSync(bundlePath, JSON.stringify(signBundle(makeUnsigned({ policy: { denylist: [] } }), privateKey)));
+  const post = await startGuard({ bundlePath, publicKeyPem: publicKey });
+
+  // Unrecognized command (classifier "ask") → approve, NOT allow (the old fail-open).
+  const unknownCmd = await post("/v1/decide/tool", {
+    sessionId: "fc",
+    toolName: "bash",
+    params: { command: "./deploy-prod --wipe" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(unknownCmd.data.decision.decision, "approve");
+
+  // Unrecognized / third-party MCP tool → approve, not allow.
+  const thirdParty = await post("/v1/decide/tool", {
+    sessionId: "fc",
+    toolName: "mcp__thirdparty__doStuff",
+    params: {},
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(thirdParty.data.decision.decision, "approve");
+
+  // Missing tool name → rejected at the HTTP boundary (400), not allowed.
+  const noName = await post("/v1/decide/tool", { sessionId: "fc", toolName: "", params: {}, workspaceDir: tmpRoot });
+  assert.equal(noName.status, 400);
+
+  // A genuinely safe read still flows through.
+  const safe = await post("/v1/decide/tool", {
+    sessionId: "fc",
+    toolName: "read",
+    params: { path: "README.md" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(safe.data.decision.decision, "allow");
+});
+
+test("fail-closed: an empty domain allowlist escalates network destinations (no allow-all)", async () => {
+  const policyPath = path.join(tmpRoot, "empty-allowlist.policy.json");
+  fs.writeFileSync(policyPath, JSON.stringify({ version: "t", allowlistedDomains: [] }));
+  const bundlePath = path.join(tmpRoot, "fc-net.bundle.json");
+  fs.writeFileSync(bundlePath, JSON.stringify(signBundle(makeUnsigned({ policy: { denylist: [] } }), privateKey)));
+  const post = await startGuard({ bundlePath, publicKeyPem: publicKey, policyPath });
+
+  const net = await post("/v1/decide/tool", {
+    sessionId: "fc-net",
+    toolName: "webfetch",
+    params: { url: "https://anything.example.org/x" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(net.data.decision.decision, "approve");
 });
 
 test.after(() => {

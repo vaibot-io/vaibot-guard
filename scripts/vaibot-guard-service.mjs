@@ -524,11 +524,12 @@ function isDeniedPath(p) {
 }
 
 function isDomainAllowlisted(dest) {
-  // Tight allowlist semantics:
-  // - If allowlist is empty: allow all (legacy behavior).
+  // Tight allowlist semantics (fail-closed):
+  // - If allowlist is empty: NOTHING is allowlisted — the caller escalates the
+  //   destination to human approval rather than allowing it.
   // - Exact host match is allowed.
   // - Subdomains are ONLY allowed when the allowlist entry is explicitly wildcarded as "*.example.com".
-  if (ALLOWLISTED_DOMAINS.length === 0) return true;
+  if (ALLOWLISTED_DOMAINS.length === 0) return false;
   try {
     const u = new URL(dest);
     const host = u.hostname.toLowerCase();
@@ -653,7 +654,18 @@ function decideExec({ sessionId, cmd, args, intent }) {
     };
   }
 
-  return { decision: "allow", reason: "Allowed by baseline policy" };
+  // Fail-closed baseline: ONLY a classifier-safe action falls through to allow.
+  // Anything the classifier rates ask (unknown/medium/high-risk command not
+  // caught above) escalates to human approval rather than being silently allowed
+  // — matching the offline breaker, which denies the same input.
+  if (clsExec.verdictHint === "allow") {
+    return { decision: "allow", reason: "Allowed by baseline policy" };
+  }
+  return {
+    decision: "approve",
+    reason: `Escalated for approval (${clsExec.risk}): ${clsExec.reasons?.[0] || "unrecognized command"}`,
+    approvalId: `appr_${randomUUID()}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +752,8 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
 
 function decideTool({ sessionId, toolName, params, workspaceDir }) {
   const tn = String(toolName || "");
+  // Fail-closed: an unidentified tool call cannot be governed → deny.
+  if (!tn.trim()) return { decision: "deny", reason: "Missing tool name" };
   const joined = tn + " " + (() => {
     try {
       return JSON.stringify(params || {});
@@ -806,8 +820,17 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
     return { decision: "allow", reason: "Allowed read" };
   }
 
-  // Default allow (keeps UX smooth). High-risk tools should be handled by the cases above.
-  return { decision: "allow", reason: "Allowed by baseline tool policy" };
+  // Fail-closed baseline: only a classifier-safe tool falls through to allow.
+  // Unknown / unrecognized / third-party (mcp__*) tools the classifier rates ask
+  // escalate to human approval rather than being silently allowed.
+  if (cls.verdictHint === "allow") {
+    return { decision: "allow", reason: "Allowed by baseline tool policy" };
+  }
+  return {
+    decision: "approve",
+    reason: `Escalated for approval (${cls.risk}): ${cls.reasons?.[0] || "unrecognized tool"}`,
+    approvalId: `appr_${randomUUID()}`,
+  };
 }
 
 function postVaibotProve({ receipt, idempotencyKey }) {
