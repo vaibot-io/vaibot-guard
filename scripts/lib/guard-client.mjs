@@ -60,6 +60,7 @@ export async function decideViaGuard(guard, request, opts = {}) {
     decision: typeof inner?.decision === 'string' ? inner.decision : 'deny',
     reason: inner?.reason ?? 'malformed guard decision',
     approvalId: inner?.approvalId ?? null,
+    floor: inner?.floor === true, // un-overridable catastrophic floor (Tier-0)
     runId: data?.runId ?? null,
     risk: data?.risk ?? null,
     raw: data,
