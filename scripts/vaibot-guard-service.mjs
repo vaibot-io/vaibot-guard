@@ -120,6 +120,8 @@ let SIGNED_POLICY;     // effectivePolicy(POLICY_BUNDLE)
 let SIGNED_DENYLIST;   // SIGNED_POLICY.denylist
 let SIGNED_DENYTOKENS; // SIGNED_POLICY.denyTokens — word-boundary command-family denials
 let SIGNED_APPROVETOKENS; // SIGNED_POLICY.approveTokens — word-boundary ask escalations
+let SIGNED_DENYPATHS;     // SIGNED_POLICY.denyPaths — unioned onto local DENY_PATHS
+let EFFECTIVE_FILEMUT_ACTION = FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION; // local ∪ signed (deny wins)
 let CLASSIFIER_TABLES; // SIGNED_POLICY.classifierTables, after the G-163 safety gate
 
 function applyLoadedBundle(loadResult) {
@@ -128,6 +130,12 @@ function applyLoadedBundle(loadResult) {
   SIGNED_DENYLIST = SIGNED_POLICY.denylist;
   SIGNED_DENYTOKENS = Array.isArray(SIGNED_POLICY.denyTokens) ? SIGNED_POLICY.denyTokens : [];
   SIGNED_APPROVETOKENS = Array.isArray(SIGNED_POLICY.approveTokens) ? SIGNED_POLICY.approveTokens : [];
+  SIGNED_DENYPATHS = Array.isArray(SIGNED_POLICY.denyPaths) ? SIGNED_POLICY.denyPaths : [];
+  // Tighten-only: a signed bundle can escalate outside-workspace writes to deny, never relax to approve.
+  EFFECTIVE_FILEMUT_ACTION =
+    (FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION === "deny" || SIGNED_POLICY.fileMutationOutsideWorkspaceAction === "deny")
+      ? "deny"
+      : "approve";
   let tables = SIGNED_POLICY.classifierTables;
   if (tables && !classifierTablesAreSafe(tables)) {
     console.error("[vaibot-guard] signed policy classifier tables would relax a protected verb to safe — rejected; using built-in defaults (fail-closed).");
@@ -517,7 +525,7 @@ function isDeniedPath(p) {
   const s0 = expandTilde(p);
   if (!s0) return false;
   const s = path.resolve(s0);
-  return DENY_PATHS.some((dp0) => {
+  return [...DENY_PATHS, ...(SIGNED_DENYPATHS || [])].some((dp0) => {
     const dp = path.resolve(expandTilde(dp0));
     return s === dp || s.startsWith(dp + path.sep);
   });
@@ -625,7 +633,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
         return { decision: "deny", reason: "File mutation touches denied path" };
       }
       if (r.unresolved || !isInsideWorkspace(r.full)) {
-        if (FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION === "approve") {
+        if (EFFECTIVE_FILEMUT_ACTION === "approve") {
           return { decision: "approve", reason: "File mutation outside workspace", approvalId: `appr_${randomUUID()}` };
         }
         return { decision: "deny", reason: "File mutation outside workspace" };
@@ -807,7 +815,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
         return { decision: "deny", reason: "File mutation touches denied path" };
       }
       if (r.unresolved || !isInsideWorkspace(r.full)) {
-        if (FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION === "approve") {
+        if (EFFECTIVE_FILEMUT_ACTION === "approve") {
           return { decision: "approve", reason: "File mutation outside workspace", approvalId: `appr_${randomUUID()}` };
         }
         return { decision: "deny", reason: "File mutation outside workspace" };

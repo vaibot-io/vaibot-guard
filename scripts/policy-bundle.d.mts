@@ -10,6 +10,10 @@ export interface PolicyBody {
   denyTokens?: string[]
   /** Word-boundary tokens that escalate to human approval ("ask") anywhere in a command. */
   approveTokens?: string[]
+  /** Paths whose mutation is denied/escalated (unioned onto the guard's local denyPaths). */
+  denyPaths?: string[]
+  /** Posture for file mutations outside the workspace; only TIGHTENS local ('deny' wins). */
+  fileMutationOutsideWorkspaceAction?: 'deny' | 'approve'
   /** Optional overrides for the classifier rule tables. */
   classifierTables?: Record<string, unknown>
 }
@@ -39,6 +43,8 @@ export interface EffectivePolicy {
   denylist: string[]
   denyTokens: string[]
   approveTokens: string[]
+  denyPaths: string[]
+  fileMutationOutsideWorkspaceAction?: 'deny' | 'approve'
   classifierTables?: Record<string, unknown>
 }
 

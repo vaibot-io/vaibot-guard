@@ -38,6 +38,6 @@
     "(?i)password\\s*[:=]\\s*[^\\s]+"
   ],
   "redactEnvKeyPatterns": ["(?i)key", "(?i)token", "(?i)secret", "(?i)pass"],
-  "fileMutationOutsideWorkspaceAction": "deny",
+  "fileMutationOutsideWorkspaceAction": "approve",
   "fileMutationDeniedPathAction": "deny"
 }

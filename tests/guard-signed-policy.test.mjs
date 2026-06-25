@@ -259,6 +259,35 @@ test("fail-closed: an empty domain allowlist escalates network destinations (no 
   assert.equal(net.data.decision.decision, "approve");
 });
 
+test("C2: signed denyPaths + outside-workspace=deny tighten file mutations", async () => {
+  const bundlePath = path.join(tmpRoot, "c2.bundle.json");
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(signBundle(makeUnsigned({
+      policy: { denylist: [], denyPaths: [path.join(tmpRoot, "vault")], fileMutationOutsideWorkspaceAction: "deny" },
+    }), privateKey)),
+  );
+  const post = await startGuard({ bundlePath, publicKeyPem: publicKey });
+
+  // A write into a signed-denied path → deny (even inside the workspace).
+  const deniedPath = await post("/v1/decide/tool", {
+    sessionId: "c2",
+    toolName: "write",
+    params: { file_path: path.join(tmpRoot, "vault", "secret.txt") },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(deniedPath.data.decision.decision, "deny");
+
+  // A write OUTSIDE the workspace → deny (signed tightened the local approve→deny).
+  const outside = await post("/v1/decide/tool", {
+    sessionId: "c2",
+    toolName: "write",
+    params: { file_path: "/tmp/c2-outside-xyz.txt" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(outside.data.decision.decision, "deny");
+});
+
 test.after(() => {
   for (const s of servers) if (!s.killed) s.kill("SIGTERM");
   try {
