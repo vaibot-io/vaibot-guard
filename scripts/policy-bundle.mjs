@@ -144,8 +144,9 @@ export function effectivePolicy(loadResult) {
       source: 'bundle',
       denylist: Array.isArray(p.denylist) ? p.denylist : [],
       denyTokens: Array.isArray(p.denyTokens) ? p.denyTokens : [],
+      approveTokens: Array.isArray(p.approveTokens) ? p.approveTokens : [],
       classifierTables: p.classifierTables ?? undefined,
     }
   }
-  return { source: 'builtin', denylist: [], denyTokens: [], classifierTables: undefined }
+  return { source: 'builtin', denylist: [], denyTokens: [], approveTokens: [], classifierTables: undefined }
 }

@@ -148,6 +148,34 @@ test("a signed denyToken blocks a command family by word boundary (C: grown bund
   assert.doesNotMatch(notTripped.data.decision.reason || "", /Denied token/);
 });
 
+test("a signed approveToken escalates a command to approval (Fix A: the ask lane)", async () => {
+  const bundlePath = path.join(tmpRoot, "approvetokens.bundle.json");
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(signBundle(makeUnsigned({ policy: { denylist: [], approveTokens: ["npm"] } }), privateKey)),
+  );
+  const post = await startGuard({ bundlePath, publicKeyPem: publicKey });
+
+  // `npm install` is escalated to human approval by the signed approveToken.
+  const asked = await post("/v1/decide/tool", {
+    sessionId: "s4",
+    toolName: "bash",
+    params: { command: "npm install lodash" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(asked.status, 200);
+  assert.equal(asked.data.decision.decision, "approve");
+
+  // An unrelated safe read is not escalated.
+  const allowed = await post("/v1/decide/tool", {
+    sessionId: "s4",
+    toolName: "read",
+    params: { path: "README.md" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(allowed.data.decision.decision, "allow");
+});
+
 test("a tampered bundle fails closed — signed denylist is ignored, posture not relaxed", async () => {
   // Sign a real bundle, then mutate the policy after signing so the signature
   // no longer matches. The guard must reject it and fall back to built-ins.

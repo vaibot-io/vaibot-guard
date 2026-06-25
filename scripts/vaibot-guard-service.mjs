@@ -119,6 +119,7 @@ let POLICY_BUNDLE;     // last loadPolicyBundle()-shaped result { ok, reason, po
 let SIGNED_POLICY;     // effectivePolicy(POLICY_BUNDLE)
 let SIGNED_DENYLIST;   // SIGNED_POLICY.denylist
 let SIGNED_DENYTOKENS; // SIGNED_POLICY.denyTokens — word-boundary command-family denials
+let SIGNED_APPROVETOKENS; // SIGNED_POLICY.approveTokens — word-boundary ask escalations
 let CLASSIFIER_TABLES; // SIGNED_POLICY.classifierTables, after the G-163 safety gate
 
 function applyLoadedBundle(loadResult) {
@@ -126,6 +127,7 @@ function applyLoadedBundle(loadResult) {
   SIGNED_POLICY = effectivePolicy(POLICY_BUNDLE);
   SIGNED_DENYLIST = SIGNED_POLICY.denylist;
   SIGNED_DENYTOKENS = Array.isArray(SIGNED_POLICY.denyTokens) ? SIGNED_POLICY.denyTokens : [];
+  SIGNED_APPROVETOKENS = Array.isArray(SIGNED_POLICY.approveTokens) ? SIGNED_POLICY.approveTokens : [];
   let tables = SIGNED_POLICY.classifierTables;
   if (tables && !classifierTablesAreSafe(tables)) {
     console.error("[vaibot-guard] signed policy classifier tables would relax a protected verb to safe — rejected; using built-in defaults (fail-closed).");
@@ -642,7 +644,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
     }
   }
 
-  const approve = matchToken(APPROVE_TOKENS, joined);
+  const approve = matchToken([...APPROVE_TOKENS, ...(SIGNED_APPROVETOKENS || [])], joined);
   if (approve) {
     return {
       decision: "approve",
@@ -756,7 +758,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   const deny = matchToken([...DENY_TOKENS, ...(SIGNED_DENYTOKENS || [])], joined);
   if (deny) return { decision: "deny", reason: `Denied token: ${deny}` };
 
-  const approve = matchToken(APPROVE_TOKENS, joined);
+  const approve = matchToken([...APPROVE_TOKENS, ...(SIGNED_APPROVETOKENS || [])], joined);
   if (approve) return { decision: "approve", reason: `Approval required for token: ${approve}`, approvalId: `appr_${randomUUID()}` };
 
   // Tool-specific posture

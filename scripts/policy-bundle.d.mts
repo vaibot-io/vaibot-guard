@@ -8,6 +8,8 @@ export interface PolicyBody {
   denylist?: string[]
   /** Word-boundary tokens denied anywhere in a command (e.g. "curl" blocks `curl …`). */
   denyTokens?: string[]
+  /** Word-boundary tokens that escalate to human approval ("ask") anywhere in a command. */
+  approveTokens?: string[]
   /** Optional overrides for the classifier rule tables. */
   classifierTables?: Record<string, unknown>
 }
@@ -36,6 +38,7 @@ export interface EffectivePolicy {
   source: 'bundle' | 'builtin'
   denylist: string[]
   denyTokens: string[]
+  approveTokens: string[]
   classifierTables?: Record<string, unknown>
 }
 
