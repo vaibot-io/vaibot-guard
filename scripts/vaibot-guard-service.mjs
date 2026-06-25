@@ -441,12 +441,18 @@ function readBody(req) {
 function matchToken(tokens, joined) {
   // Tokens are literal words (local + signed denyTokens). Escape regex metachars
   // so a signed token can never inject a pattern or throw on an invalid regex;
-  // skip empty tokens (an empty `\b\b` would match everything → fail-open).
+  // skip empty tokens. `\b` is a word/non-word transition, so only anchor an edge
+  // that is itself a word char — otherwise a token like ".env", "-rf" or "/bin/sh"
+  // INVERTS (misses the real invocation, fires on look-alikes). Bare-word families
+  // (curl, ssh, apt-get) get both boundaries; punctuation-edged tokens get none.
   return tokens.find((t) => {
-    const esc = String(t).replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+    const s = String(t);
+    const esc = s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
     if (!esc) return false;
+    const left = /^\w/.test(s) ? "\\b" : "";
+    const right = /\w$/.test(s) ? "\\b" : "";
     try {
-      return new RegExp(`\\b${esc}\\b`, "i").test(joined);
+      return new RegExp(`${left}${esc}${right}`, "i").test(joined);
     } catch {
       return false;
     }

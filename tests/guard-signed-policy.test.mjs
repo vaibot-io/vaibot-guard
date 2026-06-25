@@ -112,7 +112,7 @@ test("a signed denyToken blocks a command family by word boundary (C: grown bund
   const bundlePath = path.join(tmpRoot, "denytokens.bundle.json");
   fs.writeFileSync(
     bundlePath,
-    JSON.stringify(signBundle(makeUnsigned({ policy: { denylist: [], denyTokens: ["curl"] } }), privateKey)),
+    JSON.stringify(signBundle(makeUnsigned({ policy: { denylist: [], denyTokens: ["curl", ".env"] } }), privateKey)),
   );
   const post = await startGuard({ bundlePath, publicKeyPem: publicKey });
 
@@ -126,6 +126,17 @@ test("a signed denyToken blocks a command family by word boundary (C: grown bund
   assert.equal(denied.status, 200);
   assert.equal(denied.data.decision.decision, "deny");
   assert.match(denied.data.decision.reason, /Denied token: curl/);
+
+  // A token with a non-word leading edge (".env") still blocks the real read —
+  // the \b boundary is only anchored on word-char edges, so it doesn't invert.
+  const secret = await post("/v1/decide/tool", {
+    sessionId: "s3",
+    toolName: "bash",
+    params: { command: "cat .env" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(secret.data.decision.decision, "deny");
+  assert.match(secret.data.decision.reason, /Denied token: \.env/);
 
   // Word boundary, not substring: "curldown" must NOT trip the "curl" token.
   const notTripped = await post("/v1/decide/tool", {
