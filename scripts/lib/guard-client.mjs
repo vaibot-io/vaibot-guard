@@ -55,8 +55,10 @@ export async function decideViaGuard(guard, request, opts = {}) {
   const inner = data && typeof data.decision === 'object' ? data.decision : null
   return {
     ok: true,
-    decision: inner?.decision ?? 'allow',
-    reason: inner?.reason ?? '',
+    // Fail-closed: a 200 response with no usable decision is the guard reachable
+    // but returning garbage — treat it as DENY, never silently allow.
+    decision: typeof inner?.decision === 'string' ? inner.decision : 'deny',
+    reason: inner?.reason ?? 'malformed guard decision',
     approvalId: inner?.approvalId ?? null,
     runId: data?.runId ?? null,
     risk: data?.risk ?? null,
