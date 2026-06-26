@@ -18,6 +18,19 @@ import path from "node:path";
 import { classify } from "./classifier.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
+import { loadGuardEnvFile } from "./lib/env-file.mjs";
+
+// One shared guard, one config — regardless of launcher. Under systemd the env is
+// already populated from EnvironmentFile=~/.config/vaibot-guard/vaibot-guard.env;
+// when a plugin cold-starts the SAME guard via ensureGuard (self-spawn), nothing
+// sources that file. Fill any UNSET keys from it here so a self-spawned guard reads
+// the identical config the CLI pinned (VAIBOT_POLICY_URL + VAIBOT_POLICY_PUBKEY,
+// etc.). Real env always wins, so this is a no-op under systemd and never overrides
+// the launcher's scanned port/token. Must run before the first process.env read.
+const _envFileKeys = loadGuardEnvFile();
+if (_envFileKeys.length) {
+  console.error(`[vaibot-guard] filled ${_envFileKeys.length} setting(s) from vaibot-guard.env: ${_envFileKeys.join(", ")}`);
+}
 
 const PORT = Number(process.env.VAIBOT_GUARD_PORT || 39111);
 const HOST = process.env.VAIBOT_GUARD_HOST || "127.0.0.1";
