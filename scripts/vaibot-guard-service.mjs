@@ -1631,6 +1631,7 @@ const server = http.createServer(async (req, res) => {
         runId,
         toolName,
         params: redactIntent(params),
+        workspaceDir,
         risk,
         receiptTier,
         decision,
