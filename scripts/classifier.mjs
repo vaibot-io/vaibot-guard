@@ -102,6 +102,25 @@ const DENY_PATTERNS = [
   /\b(shutdown|reboot|halt|poweroff|init\s+0|init\s+6)\b/i,
 ]
 
+// VAIBot guard self-protection (Tier-0 floor). A governed agent must never be
+// able to kill the guard's singleton (port 39111) or stop/disable its process or
+// systemd unit — doing so would silently switch off enforcement itself. Matched
+// by port AND by name; un-overridable by any signed bundle, enforced offline.
+// Stateless limitation: a two-step `pid=$(lsof -ti:39111); kill $pid` split across
+// separate commands, or obfuscated/encoded forms, can still evade — this blocks
+// the discoverable one-liners, not every conceivable path. `restart`/`status` stay
+// allowed so the guard's own lifecycle isn't broken.
+const GUARD_PROTECT_PATTERNS = [
+  // by the singleton port: fuser -k 39111, lsof -ti:39111 | xargs kill,
+  // kill $(lsof -t -i:39111), npx kill-port 39111, P=39111; fuser -k $P/tcp …
+  /(?=[\s\S]*\b39111\b)(?=[\s\S]*\b(?:kill|pkill|killall|fuser|kill-port)\b)/i,
+  // by process/service name: pkill -f vaibot-guard-service, killall vaibot-guard,
+  // systemctl --user stop|disable|mask vaibot-guard
+  /(?=[\s\S]*\bvaibot-guard(?:-service)?\b)(?=[\s\S]*\b(?:kill|pkill|killall|stop|disable|mask|fuser|kill-port|sigkill|sigterm)\b)/i,
+  // the guard's own CLI teardown, run by an agent
+  /\bvaibot\s+guard\s+(?:stop|disable|uninstall|remove)\b/i,
+]
+
 // Elevated-risk patterns → HIGH (ask). Recoverable-but-consequential.
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
@@ -174,6 +193,10 @@ export function classifyBash(command, tables = defaultTables()) {
   const full = String(command ?? '')
   if (!full.trim()) {
     return { category: CATEGORY.EXEC, risk: RISK.MEDIUM, boundary: BOUNDARY.NONE, reversible: true, reasons: ['empty command'] }
+  }
+
+  if (anyMatch(GUARD_PROTECT_PATTERNS, full)) {
+    return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['would disable the VAIBot guard (protected: port 39111 / vaibot-guard)'] }
   }
 
   if (anyMatch(DENY_PATTERNS, full)) {
