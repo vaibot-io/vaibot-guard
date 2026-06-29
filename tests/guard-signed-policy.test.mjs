@@ -48,6 +48,7 @@ async function startGuard({ bundlePath, publicKeyPem, policyPath }) {
     VAIBOT_WORKSPACE: tmpRoot,
     VAIBOT_GUARD_LOG_DIR: logDir,
     VAIBOT_PROVE_MODE: "off",
+    VAIBOT_POLICY_URL: "off", // hermetic: exercise the LOCAL bundle, not the live control plane
     VAIBOT_POLICY_BUNDLE_PATH: bundlePath,
     VAIBOT_POLICY_PUBKEY: publicKeyPem,
   };

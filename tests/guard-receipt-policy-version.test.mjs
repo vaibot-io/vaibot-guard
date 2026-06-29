@@ -38,10 +38,11 @@ function waitUntil(fn, { timeoutMs = 6000, intervalMs = 100 } = {}) {
 }
 
 test("#17: the guard's governance receipt carries the signed policy_version", async () => {
-  // Mock V2 receipts sink — capture POST /api/v2/receipts bodies.
+  // Mock V2 governance sink — capture POST /v2/receipts bodies (the route the
+  // standalone governance API exposes; the legacy /api/ prefix was a www-proxy artifact).
   const captured = [];
   const sink = createServer((req, res) => {
-    if (req.method === "POST" && req.url === "/api/v2/receipts") {
+    if (req.method === "POST" && req.url === "/v2/receipts") {
       let body = "";
       req.on("data", (c) => { body += c; });
       req.on("end", () => {
@@ -87,7 +88,10 @@ test("#17: the guard's governance receipt carries the signed policy_version", as
       VAIBOT_PROVE_MODE: "off",
       VAIBOT_POLICY_BUNDLE_PATH: bundlePath,
       VAIBOT_POLICY_PUBKEY: publicKey,
-      VAIBOT_API_URL: `http://127.0.0.1:${sinkPort}/api`,
+      VAIBOT_POLICY_URL: "off", // exercise the LOCAL signed bundle; no control-plane fetch
+      // v3 split: governance receipts post to the V2 governance base, resolved
+      // from VAIBOT_GOVERNANCE_URL (not the deprecated VAIBOT_API_URL → provenance).
+      VAIBOT_GOVERNANCE_URL: `http://127.0.0.1:${sinkPort}`,
       VAIBOT_API_KEY: "test-key",
     },
     stdio: ["ignore", "pipe", "pipe"],

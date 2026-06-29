@@ -33,6 +33,7 @@ async function startGuard({ logDir }) {
     VAIBOT_WORKSPACE: tmpRoot,
     VAIBOT_GUARD_LOG_DIR: logDir,
     VAIBOT_PROVE_MODE: "off",
+    VAIBOT_POLICY_URL: "off", // hermetic: no control-plane policy fetch
   };
   const server = spawn(process.execPath, [SERVICE_PATH], { env, stdio: ["ignore", "pipe", "pipe"] });
   servers.push(server);

@@ -52,6 +52,7 @@ async function startGuard({ logDir, bundle }) {
     VAIBOT_WORKSPACE: tmpRoot,
     VAIBOT_GUARD_LOG_DIR: logDir,
     VAIBOT_PROVE_MODE: "off", // offline: no V2 governance API reachable
+    VAIBOT_POLICY_URL: "off", // hermetic: no control-plane policy fetch
   };
   if (bundle) {
     const bundlePath = path.join(logDir, "policy.bundle.json");

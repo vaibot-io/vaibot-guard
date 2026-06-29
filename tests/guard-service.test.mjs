@@ -27,6 +27,7 @@ const env = {
   VAIBOT_WORKSPACE: tmpRoot,
   VAIBOT_GUARD_LOG_DIR: logDir,
   VAIBOT_PROVE_MODE: "off",
+  VAIBOT_POLICY_URL: "off", // hermetic: no control-plane policy fetch — test the built-in path
 };
 
 const server = spawn(process.execPath, [SERVICE_PATH], {
@@ -73,6 +74,25 @@ test("/health responds ok", async () => {
   const data = await res.json();
   assert.equal(res.status, 200);
   assert.equal(data.ok, true);
+});
+
+test("publishes effective_mode (guard = single source) on /health and in decide responses", async () => {
+  // No control plane is configured in this harness (VAIBOT_POLICY_PATH, no
+  // VAIBOT_API_KEY) so the mode poll never fires and EFFECTIVE_MODE stays at the
+  // fail-safe default (enforce when VAIBOT_MODE is unset). The point under test is
+  // that the guard PUBLISHES one resolved mode every client can read — same value
+  // on /health and inside the decide response.
+  const health = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+  assert.equal(health.effective_mode, "enforce");
+
+  const { data } = await postJson("/v1/decide/tool", {
+    sessionId: "mode-test",
+    toolName: "read",
+    params: { path: "README.md" },
+    workspaceDir: tmpRoot,
+  });
+  assert.equal(data.effective_mode, "enforce");
+  assert.equal(data.effective_mode, health.effective_mode); // single source, consistent
 });
 
 test("/v1/decide/tool allows low-risk read", async () => {
