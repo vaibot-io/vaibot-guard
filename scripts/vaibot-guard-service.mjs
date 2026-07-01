@@ -820,13 +820,21 @@ function decideExec({ sessionId, cmd, args, intent }) {
     }
   }
 
-  const approve = matchToken([...APPROVE_TOKENS, ...(SIGNED_APPROVETOKENS || [])], joined);
-  if (approve) {
-    return {
-      decision: "approve",
-      reason: `Approval required for token: ${approve}`,
-      approvalId: `appr_${randomUUID()}`,
-    };
+  // Approve/ask token lane — two sources, two policies:
+  //  - SIGNED_APPROVETOKENS = the user's EXPLICIT "ask on this" policy → honored unconditionally.
+  //  - APPROVE_TOKENS = the built-in heuristic net → AND-conditioned on classifier concurrence:
+  //    a substring match only pauses a command the classifier ALSO rates non-safe. A match on a
+  //    classifier-safe command (".env" in a config grep, "curl" in a localhost health check,
+  //    "ncat" in a "\ncat" heredoc) must NOT pause — the classifier's "safe" verdict wins. Real
+  //    egress still pauses because the classifier itself rates it HIGH. (See the egress /
+  //    exfiltration threat-model note: secret reads are benign; exfil is the risk.)
+  const signedApprove = matchToken(SIGNED_APPROVETOKENS || [], joined);
+  if (signedApprove) {
+    return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}` };
+  }
+  const builtinApprove = matchToken(APPROVE_TOKENS, joined);
+  if (builtinApprove && clsExec.verdictHint !== "allow") {
+    return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}` };
   }
 
   // Fail-closed baseline: ONLY a classifier-safe action falls through to allow.
@@ -948,8 +956,12 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   const deny = matchToken([...DENY_TOKENS, ...(SIGNED_DENYTOKENS || [])], joined);
   if (deny) return { decision: "deny", reason: `Denied token: ${deny}` };
 
-  const approve = matchToken([...APPROVE_TOKENS, ...(SIGNED_APPROVETOKENS || [])], joined);
-  if (approve) return { decision: "approve", reason: `Approval required for token: ${approve}`, approvalId: `appr_${randomUUID()}` };
+  // Approve/ask token lane — signed tokens honored unconditionally; the built-in heuristic net is
+  // AND-conditioned on classifier concurrence (see decideExec + the egress threat-model note).
+  const signedApprove = matchToken(SIGNED_APPROVETOKENS || [], joined);
+  if (signedApprove) return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}` };
+  const builtinApprove = matchToken(APPROVE_TOKENS, joined);
+  if (builtinApprove && cls.verdictHint !== "allow") return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}` };
 
   // Tool-specific posture
   const lower = tn.toLowerCase();

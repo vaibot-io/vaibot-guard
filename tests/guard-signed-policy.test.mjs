@@ -177,6 +177,39 @@ test("a signed approveToken escalates a command to approval (Fix A: the ask lane
   assert.equal(allowed.data.decision.decision, "allow");
 });
 
+test("built-in APPROVE_TOKENS is AND-conditioned: a token substring on a classifier-safe command does NOT pause; real egress + privilege still do", async () => {
+  // Empty signed approveTokens → only the built-in policy.default.json approveTokens (.env, curl, su, …) apply.
+  const bundlePath = path.join(tmpRoot, "and-gate.bundle.json");
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(signBundle(makeUnsigned({ policy: { denylist: [], approveTokens: [], escalateAt: "high" } }), privateKey)),
+  );
+  const post = await startGuard({ bundlePath, publicKeyPem: publicKey });
+
+  // ".env" matches a built-in approveToken, but the command is classifier-SAFE → allow (AND suppresses the token).
+  const secretRead = await post("/v1/decide/exec", {
+    sessionId: "and", cmd: "grep", args: ["FOO", "app.env"],
+    intent: { tool: "bash", action: "run", command: "grep FOO app.env", cwd: tmpRoot },
+  });
+  assert.equal(secretRead.status, 200);
+  assert.equal(secretRead.data.decision.decision, "allow");
+
+  // "curl" matches a built-in approveToken AND the classifier rates it HIGH → the token fires → approve.
+  const egress = await post("/v1/decide/exec", {
+    sessionId: "and", cmd: "curl", args: ["https://example.com"],
+    intent: { tool: "bash", action: "run", command: "curl https://example.com", cwd: tmpRoot },
+  });
+  assert.equal(egress.data.decision.decision, "approve");
+  assert.match(egress.data.decision.reason, /token: curl/);
+
+  // Privilege escalation: `su` is now classifier-HIGH, so it pauses (not silently allowed under AND).
+  const priv = await post("/v1/decide/exec", {
+    sessionId: "and", cmd: "su", args: ["-"],
+    intent: { tool: "bash", action: "run", command: "su -", cwd: tmpRoot },
+  });
+  assert.equal(priv.data.decision.decision, "approve");
+});
+
 test("a tampered bundle fails closed — signed denylist is ignored, posture not relaxed", async () => {
   // Sign a real bundle, then mutate the policy after signing so the signature
   // no longer matches. The guard must reject it and fall back to built-ins.

@@ -124,6 +124,7 @@ const GUARD_PROTECT_PATTERNS = [
 // Elevated-risk patterns → HIGH (ask). Recoverable-but-consequential.
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
+  /(^|[\n|&;]\s*)su\b/i, // bare `su` — privilege escalation, same class as sudo
   /\bgit\s+push\b/i,
   /\b(npm|pnpm|yarn)\s+publish\b/i,
   /\b(flyctl?|fly|vercel|netlify)\s+deploy\b/i,
