@@ -203,6 +203,7 @@ let SIGNED_POLICY;     // effectivePolicy(POLICY_BUNDLE)
 let SIGNED_DENYLIST;   // SIGNED_POLICY.denylist
 let SIGNED_DENYTOKENS; // SIGNED_POLICY.denyTokens — word-boundary command-family denials
 let SIGNED_APPROVETOKENS; // SIGNED_POLICY.approveTokens — word-boundary ask escalations
+let SIGNED_ESCALATE_AT;   // SIGNED_POLICY.escalateAt — per-preset ask threshold (undefined ⇒ default MEDIUM)
 let SIGNED_DENYPATHS;     // SIGNED_POLICY.denyPaths — unioned onto local DENY_PATHS
 let EFFECTIVE_FILEMUT_ACTION = FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION; // local ∪ signed (deny wins)
 let CLASSIFIER_TABLES; // SIGNED_POLICY.classifierTables, after the G-163 safety gate
@@ -213,6 +214,7 @@ function applyLoadedBundle(loadResult) {
   SIGNED_DENYLIST = SIGNED_POLICY.denylist;
   SIGNED_DENYTOKENS = Array.isArray(SIGNED_POLICY.denyTokens) ? SIGNED_POLICY.denyTokens : [];
   SIGNED_APPROVETOKENS = Array.isArray(SIGNED_POLICY.approveTokens) ? SIGNED_POLICY.approveTokens : [];
+  SIGNED_ESCALATE_AT = typeof SIGNED_POLICY.escalateAt === "string" ? SIGNED_POLICY.escalateAt : undefined;
   SIGNED_DENYPATHS = Array.isArray(SIGNED_POLICY.denyPaths) ? SIGNED_POLICY.denyPaths : [];
   // Tighten-only: a signed bundle can escalate outside-workspace writes to deny, never relax to approve.
   EFFECTIVE_FILEMUT_ACTION =
@@ -775,7 +777,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
 
   // D: signed-policy denylist + classifier dangerous-deny (safety floor).
   if (SIGNED_DENYLIST.includes(String(cmd))) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES });
+  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0) so clients
   // can enforce it even in observe mode.
   if (clsExec.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${clsExec.reasons[0] || "dangerous"}`, floor: true };
@@ -938,7 +940,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   // D: signed-policy denylist (safety floor) + classifier dangerous-deny —
   // checked before the guard's own token/rule posture so they can only ADD denies.
   if (SIGNED_DENYLIST.includes(tn)) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES });
+  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0).
   if (cls.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${cls.reasons[0] || "dangerous"}`, floor: true };
 

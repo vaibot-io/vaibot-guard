@@ -21,10 +21,15 @@ test("pinned staging pubkey is a well-formed Ed25519 SPKI PEM", () => {
   assert.equal(body.length, 60);
 });
 
-test("prod pubkey is an empty placeholder until provisioned", () => {
-  // Intentional: see comment in pinned-keys.mjs. When prod is set up, this
-  // test should be updated to mirror the staging-shape check above.
-  assert.equal(PINNED_PROD_PUBKEY, "");
+test("prod pubkey is provisioned (Ed25519 SPKI PEM, 32-byte key)", () => {
+  // Provisioned 2026-07-01 on vaibot-api-v2. Mirrors the staging-shape check above.
+  assert.match(PINNED_PROD_PUBKEY, /-----BEGIN PUBLIC KEY-----/);
+  assert.match(PINNED_PROD_PUBKEY, /-----END PUBLIC KEY-----/);
+  const body = PINNED_PROD_PUBKEY
+    .replace(/-----BEGIN PUBLIC KEY-----/, "")
+    .replace(/-----END PUBLIC KEY-----/, "")
+    .replace(/\s/g, "");
+  assert.equal(body.length, 60);
 });
 
 test("VAIBOT_POLICY_PUBKEY override wins over everything else", () => {
