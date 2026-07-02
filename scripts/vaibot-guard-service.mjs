@@ -777,7 +777,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
 
   // D: signed-policy denylist + classifier dangerous-deny (safety floor).
   if (SIGNED_DENYLIST.includes(String(cmd))) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
+  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0) so clients
   // can enforce it even in observe mode.
   if (clsExec.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${clsExec.reasons[0] || "dangerous"}`, floor: true };
@@ -948,7 +948,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   // D: signed-policy denylist (safety floor) + classifier dangerous-deny —
   // checked before the guard's own token/rule posture so they can only ADD denies.
   if (SIGNED_DENYLIST.includes(tn)) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
+  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0).
   if (cls.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${cls.reasons[0] || "dangerous"}`, floor: true };
 
