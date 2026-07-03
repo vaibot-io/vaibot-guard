@@ -8,6 +8,7 @@
 // universal fallback and always terminates the list.
 
 import { existsSync, readFileSync } from 'node:fs'
+import { join, delimiter } from 'node:path'
 
 // Inside a container? Containers rarely have a usable per-user service supervisor,
 // so the guard self-spawns there.
@@ -28,6 +29,24 @@ export function detectCI({ env = process.env } = {}) {
     env.CI || env.CONTINUOUS_INTEGRATION || env.GITHUB_ACTIONS || env.GITLAB_CI ||
     env.BUILDKITE || env.CIRCLECI || env.TRAVIS || env.JENKINS_URL || env.TEAMCITY_VERSION
   )
+}
+
+// Real PATH lookup: is `name` an executable on PATH? This is the DEFAULT hasCmd
+// probe for serviceTiers in production (tests inject a fake). Without it, detection
+// defaulted to "command absent" and every platform fell through to self-spawn.
+export function commandExists(name, env = process.env) {
+  const dirs = String(env.PATH || '').split(delimiter).filter(Boolean)
+  const exts = process.platform === 'win32'
+    ? String(env.PATHEXT || '.EXE;.CMD;.BAT').split(';').map((e) => e.trim()).filter(Boolean)
+    : ['']
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      try {
+        if (existsSync(join(dir, name + ext))) return true
+      } catch { /* ignore unreadable PATH entries */ }
+    }
+  }
+  return false
 }
 
 /**
@@ -52,7 +71,7 @@ export function serviceTiers(opts = {}) {
     uid = typeof process.getuid === 'function' ? process.getuid() : null,
     isContainer = detectContainer({ env }),
     isCI = detectCI({ env }),
-    hasCmd = () => false,
+    hasCmd = commandExists,
     canSudo = false,
   } = opts
 
