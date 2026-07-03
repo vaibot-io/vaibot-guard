@@ -33,26 +33,26 @@ have git  || die "git is required."
 OS="$(uname -s 2>/dev/null || echo unknown)"
 info "OS=$OS  branch=$BRANCH  node=$(node -v)"
 
-# ---- 1. guard from the branch (provides vaibot-guard + vaibot-guard-service) ----
-# Install from a fresh CLONE, not `npm i -g github:...#branch`: npm (and version
-# managers like Volta that key on package version) cache git-branch installs and
-# happily serve a stale commit — a local-path install is deterministic every time.
-info "Installing @vaibot/guard from the test branch (fresh clone → local install)..."
-GUARD_SRC="$(mktemp -d)/guard"
-git clone -q -b "$BRANCH" "${GH}/vaibot-guard.git" "$GUARD_SRC" || die "cloning the guard from the branch failed."
-if command -v volta >/dev/null 2>&1; then volta uninstall @vaibot/guard >/dev/null 2>&1 || true; fi
-npm uninstall -g @vaibot/guard >/dev/null 2>&1 || true
-npm install -g "$GUARD_SRC" \
-  || die "npm global install of the guard failed. If it's a permissions error, fix your npm global prefix (nvm, or 'npm config set prefix ~/.npm-global') and re-run."
-have vaibot-guard || die "vaibot-guard did not land on PATH — ensure your npm (or ~/.volta/bin) global bin dir is on PATH."
+# ---- 1. guard from the branch → a STABLE local location ----
+# Clone to a PERSISTENT dir (not /tmp) so the service's ExecStart path survives, and
+# run the guard via `node <path>` directly. Global npm bins are unreliable under
+# version managers like Volta ("Could not execute command"), and the plugins vendor
+# their own guard anyway — so we deliberately do NOT depend on a global bin.
+GUARD_HOME="${VAIBOT_GUARD_HOME:-$HOME/.vaibot/src/guard}"
+info "Installing @vaibot/guard from the test branch into $GUARD_HOME ..."
+rm -rf "$GUARD_HOME" 2>/dev/null || true
+mkdir -p "$(dirname "$GUARD_HOME")"
+git clone -q -b "$BRANCH" "${GH}/vaibot-guard.git" "$GUARD_HOME" || die "cloning the guard from the branch failed."
+GUARD_CLI="$GUARD_HOME/scripts/vaibot-guard.mjs"
+[ -f "$GUARD_CLI" ] || die "guard CLI not found at $GUARD_CLI after clone."
 
 # ---- 2. bring the guard up via the platform-aware ladder ----
 if [ "${VAIBOT_SKIP_GUARD_START:-0}" != "1" ]; then
   info "Starting the guard (platform-aware: systemd / launchd / self-spawn)..."
   if [ "${VAIBOT_SYSTEM:-0}" = "1" ]; then
-    vaibot-guard install --system || warn "guard --system install reported an issue — see ~/.vaibot/guard/launch.log"
+    node "$GUARD_CLI" install --system || warn "guard --system install reported an issue — see ~/.vaibot/guard/launch.log"
   else
-    vaibot-guard install || warn "guard install reported an issue — see ~/.vaibot/guard/launch.log (it self-spawns on the first tool call regardless)"
+    node "$GUARD_CLI" install || warn "guard install reported an issue — see ~/.vaibot/guard/launch.log (it self-spawns on the first tool call regardless)"
   fi
 fi
 
