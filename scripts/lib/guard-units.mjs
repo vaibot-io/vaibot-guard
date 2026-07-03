@@ -37,7 +37,7 @@ WantedBy=${wantedBy}
 //   scope 'user'   → LaunchAgent (~/Library/LaunchAgents), runs in the user session
 //   scope 'system' → LaunchDaemon (/Library/LaunchDaemons), root-owned = tamper boundary
 // RunAtLoad + KeepAlive give the same single-instance + auto-restart as systemd.
-export function launchdPlist({ label, programArgs, envVars = {}, workingDir } = {}) {
+export function launchdPlist({ label, programArgs, envVars = {}, workingDir, stdout, stderr } = {}) {
   if (!label || !Array.isArray(programArgs) || programArgs.length === 0) {
     throw new Error('launchdPlist: label + non-empty programArgs[] are required')
   }
@@ -50,6 +50,10 @@ export function launchdPlist({ label, programArgs, envVars = {}, workingDir } = 
         .join('\n')}\n  </dict>\n`
     : ''
   const wd = workingDir ? `  <key>WorkingDirectory</key>\n  <string>${esc(workingDir)}</string>\n` : ''
+  // StandardOut/ErrorPath make a crash-looping job diagnosable — without them a launchd
+  // service that exits on startup is completely silent (no way to see why it failed).
+  const out = stdout ? `  <key>StandardOutPath</key>\n  <string>${esc(stdout)}</string>\n` : ''
+  const err = stderr ? `  <key>StandardErrorPath</key>\n  <string>${esc(stderr)}</string>\n` : ''
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -60,7 +64,7 @@ export function launchdPlist({ label, programArgs, envVars = {}, workingDir } = 
   <array>
 ${args}
   </array>
-${envBlock}${wd}  <key>RunAtLoad</key>
+${envBlock}${wd}${out}${err}  <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>

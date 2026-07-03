@@ -76,7 +76,7 @@ export function preCleanCommands(platform, scope, uid) {
 // Generate + write the unit for one tier, then run its enable/start commands in order.
 // Returns { ok, ran:[...], error? }. Injectable { write, mkdir, run } for tests.
 export async function installTier(opts, deps = {}) {
-  const { platform, scope, execStart, programArgs, envFile, envVars, uid, home = homedir() } = opts
+  const { platform, scope, execStart, programArgs, envFile, envVars, uid, workingDir, stdout, stderr, home = homedir() } = opts
   const { write = writeFileSync, mkdir = mkdirSync, run } = deps
   const runCmd = run ?? (async (cmd, args) => { await promisify(_execFile)(cmd, args); return true })
 
@@ -87,7 +87,7 @@ export async function installTier(opts, deps = {}) {
     const content =
       platform === 'linux'
         ? systemdUnit({ execStart, envFile, scope })
-        : launchdPlist({ label: GUARD_LABEL, programArgs, envVars })
+        : launchdPlist({ label: GUARD_LABEL, programArgs, envVars, workingDir, stdout, stderr })
     write(path, content, { mode: 0o644 })
   } catch (e) {
     return { ok: false, error: `write unit: ${e?.message ?? e}` }

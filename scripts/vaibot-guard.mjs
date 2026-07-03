@@ -271,11 +271,18 @@ async function cmdInstall() {
   ensureGuardToken(ENV_FILE);
 
   const useSystem = flags["system"] === true || flags["system"] === "true";
+  // launchd runs with CWD=/ and no stdout — set a working dir so the guard's default
+  // workspace is sane, and capture stdout/stderr so a startup crash is visible.
+  const guardDir = path.join(os.homedir(), ".vaibot", "guard");
+  try { fs.mkdirSync(guardDir, { recursive: true }); } catch { /* best-effort */ }
   const res = await installGuardService({
     execStart: `/usr/bin/env node ${serviceScript}`,
     programArgs: [process.execPath, serviceScript],
     envFile: ENV_FILE,
     envVars: { VAIBOT_GUARD_ENV_FILE: ENV_FILE },
+    workingDir: os.homedir(),
+    stdout: path.join(guardDir, "launchd.out.log"),
+    stderr: path.join(guardDir, "launchd.err.log"),
     uid: typeof process.getuid === "function" ? process.getuid() : undefined,
     canSudo: useSystem,
   });
