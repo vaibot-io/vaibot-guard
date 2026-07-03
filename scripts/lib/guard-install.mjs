@@ -56,6 +56,23 @@ export function startCommands(platform, scope, uid) {
   return []
 }
 
+// Best-effort idempotency cleanup run BEFORE the start commands: remove a prior
+// registration so `launchctl bootstrap` (and a failed systemd unit) don't error on
+// re-install. Failures are ignored — nothing to clean is the normal first-run case.
+export function preCleanCommands(platform, scope, uid) {
+  const sudo = scope === 'system'
+  const wrap = (cmd, args) => (sudo ? ['sudo', ['-n', cmd, ...args]] : [cmd, args])
+  if (platform === 'darwin') {
+    const domain = scope === 'system' ? 'system' : `gui/${uid ?? ''}`
+    return [wrap('launchctl', ['bootout', `${domain}/${GUARD_LABEL}`])]
+  }
+  if (platform === 'linux') {
+    const scopeFlag = scope === 'system' ? [] : ['--user']
+    return [wrap('systemctl', [...scopeFlag, 'reset-failed', GUARD_UNIT])]
+  }
+  return []
+}
+
 // Generate + write the unit for one tier, then run its enable/start commands in order.
 // Returns { ok, ran:[...], error? }. Injectable { write, mkdir, run } for tests.
 export async function installTier(opts, deps = {}) {
@@ -74,6 +91,11 @@ export async function installTier(opts, deps = {}) {
     write(path, content, { mode: 0o644 })
   } catch (e) {
     return { ok: false, error: `write unit: ${e?.message ?? e}` }
+  }
+
+  // Idempotency: best-effort removal of any prior registration (failures ignored).
+  for (const [cmd, args] of preCleanCommands(platform, scope, uid)) {
+    try { await runCmd(cmd, args) } catch { /* nothing to clean — expected on first install */ }
   }
 
   const ran = []

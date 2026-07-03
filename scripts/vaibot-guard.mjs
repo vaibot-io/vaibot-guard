@@ -281,8 +281,15 @@ async function cmdInstall() {
   });
 
   if (res.selfSpawn) {
-    console.log("[vaibot-guard] No usable service supervisor here (container / CI / Windows, or systemctl/launchctl absent).");
-    console.log("[vaibot-guard] The guard will self-spawn on the first agent tool call — nothing to install.");
+    const { detectContainer, detectCI, commandExists } = await import("./lib/guard-supervisor.mjs");
+    const why = [];
+    if (detectContainer()) why.push("container detected");
+    if (detectCI()) why.push("CI environment detected (a CI_* env var is set)");
+    if (process.platform === "darwin" && !commandExists("launchctl")) why.push("launchctl not on PATH");
+    else if (process.platform === "linux" && !commandExists("systemctl")) why.push("systemctl not on PATH");
+    else if (process.platform !== "darwin" && process.platform !== "linux") why.push(`unsupported platform '${process.platform}'`);
+    console.log(`[vaibot-guard] No managed service tier selected — reason: ${why.join("; ") || "unknown (platform " + process.platform + ")"}.`);
+    console.log("[vaibot-guard] Self-spawning on the first agent tool call instead — governance is still enforced, just not auto-started at boot.");
     process.exit(0);
   }
   if (!res.ok) {

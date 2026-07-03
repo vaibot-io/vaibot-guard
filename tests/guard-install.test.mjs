@@ -33,7 +33,8 @@ test('installTier: writes unit + runs enable (injected)', async () => {
   assert.equal(res.ok, true)
   assert.equal(writes[0][0], '/home/x/.config/systemd/user/vaibot-guard.service')
   assert.match(writes[0][1], /ExecStart=\/usr\/bin\/node x\.mjs/)
-  assert.equal(runs.length, 2)
+  assert.deepEqual(runs[0], ['systemctl', '--user', 'reset-failed', 'vaibot-guard']) // pre-clean first
+  assert.equal(runs.length, 3) // reset-failed + daemon-reload + enable
 })
 
 test('installTier: enable failure → ok:false + error', async () => {
