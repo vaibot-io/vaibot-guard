@@ -236,6 +236,72 @@ async function maybeOnboard() {
   }
 }
 
+// Poll GET /health until healthy or timeout. Used to gate a service install.
+async function pollGuardHealth(port, timeoutMs) {
+  const token = getConfig("VAIBOT_GUARD_TOKEN", "");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://${GUARD_HOST}:${port}/health`, {
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        signal: AbortSignal.timeout(1000),
+      });
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (body && body.ok === true) return true;
+      }
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+// `vaibot-guard install` — non-interactive, platform-aware service install. Walks the
+// root-preferred ladder (systemd / launchd / self-spawn) via installGuardService, writes
+// + starts the best available tier, then health-verifies. `--system` opts into the
+// root/sudo tamper-boundary tier. Exits 0 on healthy (or self-spawn), 1 on trouble.
+async function cmdInstall() {
+  const [{ installGuardService }, { readGuardEndpoint }] = await Promise.all([
+    import("./lib/guard-install.mjs"),
+    import("./lib/creds.mjs"),
+  ]);
+  const serviceScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "vaibot-guard-service.mjs");
+
+  // Ensure a token + env file exist before the supervisor loads them.
+  ensureGuardToken(ENV_FILE);
+
+  const useSystem = flags["system"] === true || flags["system"] === "true";
+  const res = await installGuardService({
+    execStart: `/usr/bin/env node ${serviceScript}`,
+    programArgs: [process.execPath, serviceScript],
+    envFile: ENV_FILE,
+    envVars: { VAIBOT_GUARD_ENV_FILE: ENV_FILE },
+    uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+    canSudo: useSystem,
+  });
+
+  if (res.selfSpawn) {
+    console.log("[vaibot-guard] No usable service supervisor here (container / CI / Windows, or systemctl/launchctl absent).");
+    console.log("[vaibot-guard] The guard will self-spawn on the first agent tool call — nothing to install.");
+    process.exit(0);
+  }
+  if (!res.ok) {
+    console.error(`[vaibot-guard] Service install failed (${res.tier} tier): ${res.error || "unknown"}`);
+    console.error("[vaibot-guard] The guard falls back to self-spawn on the next tool call. See ~/.vaibot/guard/launch.log.");
+    process.exit(1);
+  }
+  console.log(`[vaibot-guard] Installed + started as a ${res.tier}-scope service.`);
+
+  const port = readGuardEndpoint()?.port ?? GUARD_PORT;
+  const healthy = await pollGuardHealth(port, 8000);
+  if (healthy) {
+    console.log(`[vaibot-guard] Healthy on ${GUARD_HOST}:${port}.`);
+    process.exit(0);
+  }
+  console.error("[vaibot-guard] WARN: not healthy within 8s. Check `systemctl --user status vaibot-guard` and ~/.vaibot/guard/launch.log.");
+  process.exit(1);
+}
+
 async function cmdInstallLocal() {
   if (!process.stdin.isTTY) {
     die("install-local requires a TTY");
@@ -395,6 +461,10 @@ async function cmdConfigure() {
   } finally {
     rl.close();
   }
+}
+
+if (command === "install") {
+  await cmdInstall();
 }
 
 if (command === "install-local") {
