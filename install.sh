@@ -34,10 +34,17 @@ OS="$(uname -s 2>/dev/null || echo unknown)"
 info "OS=$OS  branch=$BRANCH  node=$(node -v)"
 
 # ---- 1. guard from the branch (provides vaibot-guard + vaibot-guard-service) ----
-info "Installing @vaibot/guard from the test branch (this provides the guard bins)..."
-npm install -g "github:vaibot-io/vaibot-guard#${BRANCH}" \
+# Install from a fresh CLONE, not `npm i -g github:...#branch`: npm (and version
+# managers like Volta that key on package version) cache git-branch installs and
+# happily serve a stale commit — a local-path install is deterministic every time.
+info "Installing @vaibot/guard from the test branch (fresh clone → local install)..."
+GUARD_SRC="$(mktemp -d)/guard"
+git clone -q -b "$BRANCH" "${GH}/vaibot-guard.git" "$GUARD_SRC" || die "cloning the guard from the branch failed."
+if command -v volta >/dev/null 2>&1; then volta uninstall @vaibot/guard >/dev/null 2>&1 || true; fi
+npm uninstall -g @vaibot/guard >/dev/null 2>&1 || true
+npm install -g "$GUARD_SRC" \
   || die "npm global install of the guard failed. If it's a permissions error, fix your npm global prefix (nvm, or 'npm config set prefix ~/.npm-global') and re-run."
-have vaibot-guard || die "vaibot-guard did not land on PATH after install — check your npm global bin dir is on PATH."
+have vaibot-guard || die "vaibot-guard did not land on PATH — ensure your npm (or ~/.volta/bin) global bin dir is on PATH."
 
 # ---- 2. bring the guard up via the platform-aware ladder ----
 if [ "${VAIBOT_SKIP_GUARD_START:-0}" != "1" ]; then
