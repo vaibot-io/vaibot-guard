@@ -20,7 +20,7 @@ import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } fr
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
 import { loadGuardEnvFile } from "./lib/env-file.mjs";
-import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv, urlOverrideAllowed, gateUrlOverride } from "./lib/creds.mjs";
+import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv, urlOverrideAllowed, gateUrlOverride, readGuardEndpoint } from "./lib/creds.mjs";
 
 // One shared guard, one config — regardless of launcher. Under systemd the env is
 // already populated from EnvironmentFile=~/.config/vaibot-guard/vaibot-guard.env;
@@ -34,7 +34,9 @@ if (_envFileKeys.length) {
   console.error(`[vaibot-guard] filled ${_envFileKeys.length} setting(s) from vaibot-guard.env: ${_envFileKeys.join(", ")}`);
 }
 
-const PORT = Number(process.env.VAIBOT_GUARD_PORT || 39111);
+// Port precedence: explicit env (launcher scan / systemd env file) → the persisted
+// credentials.json endpoint → a last-resort default hint. Never a hardcoded contract.
+const PORT = Number(process.env.VAIBOT_GUARD_PORT) || readGuardEndpoint()?.port || 39111;
 const HOST = process.env.VAIBOT_GUARD_HOST || "127.0.0.1";
 
 // ---- API config from the credentials file (v3 split: V2 governance / V1 provenance)
