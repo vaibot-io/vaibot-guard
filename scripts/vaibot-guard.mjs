@@ -237,7 +237,13 @@ async function maybeOnboard() {
 }
 
 // Poll GET /health until healthy or timeout. Used to gate a service install.
-async function pollGuardHealth(port, timeoutMs) {
+// Poll GET /health until healthy or timeout. `ownership` = { sinceMs, readLock }: when
+// given, additionally require the rendezvous (guard.json) to show OUR freshly-started
+// instance on this exact port — i.e. an instance that started at/after the install began.
+// That distinguishes "the unit WE just started answered" from "a stale/foreign guard
+// already squatting this port answered while our unit crash-loops behind it" — WITHOUT
+// authenticating /health. Without `ownership`, it's a plain unauthenticated /health check.
+async function pollGuardHealth(port, timeoutMs, ownership = null) {
   const token = getConfig("VAIBOT_GUARD_TOKEN", "");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -248,7 +254,16 @@ async function pollGuardHealth(port, timeoutMs) {
       });
       if (res.ok) {
         const body = await res.json().catch(() => ({}));
-        if (body && body.ok === true) return true;
+        const alive = !!(body && body.ok === true);
+        if (alive && !ownership) return true;
+        if (alive && ownership) {
+          const lock = ownership.readLock();
+          const owned =
+            lock &&
+            Number(lock.port) === Number(port) &&
+            (Number(lock.startedAt) || 0) >= ownership.sinceMs;
+          if (owned) return true;
+        }
       }
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 300));
@@ -261,9 +276,10 @@ async function pollGuardHealth(port, timeoutMs) {
 // + starts the best available tier, then health-verifies. `--system` opts into the
 // root/sudo tamper-boundary tier. Exits 0 on healthy (or self-spawn), 1 on trouble.
 async function cmdInstall() {
-  const [{ installGuardService }, { readGuardEndpoint }] = await Promise.all([
+  const [{ installGuardService }, { readGuardEndpoint, writeGuardEndpoint }, { readLock }] = await Promise.all([
     import("./lib/guard-install.mjs"),
     import("./lib/creds.mjs"),
+    import("./lib/guard-bootstrap.mjs"),
   ]);
   const serviceScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "vaibot-guard-service.mjs");
 
@@ -275,11 +291,19 @@ async function cmdInstall() {
   // workspace is sane, and capture stdout/stderr so a startup crash is visible.
   const guardDir = path.join(os.homedir(), ".vaibot", "guard");
   try { fs.mkdirSync(guardDir, { recursive: true }); } catch { /* best-effort */ }
+
+  // Pin + persist the endpoint so the unit, the health-verify, and every client agree on
+  // ONE port — never a bare default a foreign guard might already hold. Record the install
+  // start so the health-verify can confirm OUR fresh unit (not a stale process) took over.
+  const guardPort = readGuardEndpoint()?.port ?? GUARD_PORT;
+  try { writeGuardEndpoint({ host: GUARD_HOST, port: guardPort }); } catch { /* best-effort */ }
+  const installStart = Date.now();
+
   const res = await installGuardService({
     execStart: `/usr/bin/env node ${serviceScript}`,
     programArgs: [process.execPath, serviceScript],
     envFile: ENV_FILE,
-    envVars: { VAIBOT_GUARD_ENV_FILE: ENV_FILE },
+    envVars: { VAIBOT_GUARD_ENV_FILE: ENV_FILE, VAIBOT_GUARD_PORT: String(guardPort) },
     workingDir: os.homedir(),
     stdout: path.join(guardDir, "launchd.out.log"),
     stderr: path.join(guardDir, "launchd.err.log"),
@@ -306,13 +330,19 @@ async function cmdInstall() {
   }
   console.log(`[vaibot-guard] Installed + started as a ${res.tier}-scope service.`);
 
-  const port = readGuardEndpoint()?.port ?? GUARD_PORT;
-  const healthy = await pollGuardHealth(port, 8000);
+  // Verify OUR freshly-started unit is actually serving on the pinned port — not a stale
+  // guard already squatting it while our unit crash-loops behind it (no /health gating;
+  // the ownership check reads the rendezvous startedAt).
+  const healthy = await pollGuardHealth(guardPort, 8000, { sinceMs: installStart, readLock });
   if (healthy) {
-    console.log(`[vaibot-guard] Healthy on ${GUARD_HOST}:${port}.`);
+    console.log(`[vaibot-guard] Healthy on ${GUARD_HOST}:${guardPort}.`);
     process.exit(0);
   }
-  console.error("[vaibot-guard] WARN: not healthy within 8s. Check `systemctl --user status vaibot-guard` and ~/.vaibot/guard/launch.log.");
+  console.error(
+    `[vaibot-guard] WARN: the service did not take over ${GUARD_HOST}:${guardPort} within 8s ` +
+    "(crash-loop, or another guard already holds the port). Check `systemctl --user status " +
+    "vaibot-guard`, ~/.vaibot/guard/launchd.err.log, and stop any stray guard, then retry.",
+  );
   process.exit(1);
 }
 
