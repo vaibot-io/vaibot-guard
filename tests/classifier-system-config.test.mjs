@@ -48,3 +48,39 @@ test("#4: benign system-config stays on the ask lane, not denied", () => {
     assert.equal(isDeny(cmd), false, `should NOT hard-deny: ${cmd}`);
   }
 });
+
+const riskOf = (cmd) => classify({ tool: "exec", input: { command: cmd } }, {}).risk;
+
+test("lifecycle: the guard's own forward lifecycle is allowed (systemd + macOS launchctl + CLI + :39111 probe)", () => {
+  for (const cmd of [
+    "systemctl status vaibot-guard",
+    "systemctl --user enable --now vaibot-guard",
+    "systemctl restart vaibot-guard-service",
+    "launchctl bootstrap gui/501 /Users/b/Library/LaunchAgents/io.vaibot.guard.plist",
+    "launchctl kickstart -k gui/501/io.vaibot.guard",
+    "launchctl list io.vaibot.guard",
+    "service vaibot-guard start",
+    "vaibot-guard install",
+    "node scripts/vaibot-guard-service.mjs",
+    "curl -s http://127.0.0.1:39111/health",
+  ]) {
+    assert.equal(riskOf(cmd), "safe", `guard lifecycle should be allowed: ${cmd}`);
+  }
+});
+
+test("lifecycle: guard teardown + shell injection still hard-deny (the allow can't be abused)", () => {
+  for (const cmd of [
+    "systemctl stop vaibot-guard",
+    "launchctl bootout gui/501/io.vaibot.guard",
+    "service vaibot-guard stop",
+    "systemctl status vaibot-guard; rm -rf /tmp/x",
+  ]) {
+    assert.equal(riskOf(cmd), "dangerous", `should still deny: ${cmd}`);
+  }
+});
+
+test("lifecycle: NON-guard system-config is unaffected (not allow-listed)", () => {
+  for (const cmd of ["systemctl status nginx", "service nginx start"]) {
+    assert.notEqual(riskOf(cmd), "safe", `non-guard system-config must not be allow-listed: ${cmd}`);
+  }
+});
