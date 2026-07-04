@@ -121,6 +121,21 @@ const GUARD_PROTECT_PATTERNS = [
   /\bvaibot\s+guard\s+(?:stop|disable|uninstall|remove)\b/i,
 ]
 
+// Destructive host-config verbs → un-overridable HARD-DENY (Phase-3 #4). Stopping,
+// disabling, or masking a service, unloading/removing a launchd job, or wiping/installing
+// a crontab can take down a security service (auditd/firewalld) or plant persistence.
+// Matched on the FULL command so wrapped/absolute/`sh -c` forms are covered too
+// (`/usr/bin/systemctl disable auditd`, `sh -c 'crontab job'`), and because the verdict is
+// DANGEROUS it can't be downgraded to ask by any signed preset. Benign system-config
+// (status/list/-l) is NOT matched here and stays on the ask lane (SYSTEM_CONFIG_CMDS below).
+const SYSTEM_CONFIG_DENY_PATTERNS = [
+  /\bsystemctl\b[^|&;\n]*\b(stop|disable|mask|kill)\b/i,
+  /\bservice\b\s+\S+\s+(stop|force-reload)\b/i,
+  /\blaunchctl\b[^|&;\n]*\b(unload|remove|bootout|disable)\b/i,
+  // crontab -r (wipe all), crontab - (install from stdin), crontab <file> (install); -l/-e stay on ask
+  /\bcrontab\b\s+(?:-u\s+\S+\s+)?(-r\b|-(?:\s|$)|[^\-\s]\S*)/i,
+]
+
 // Elevated-risk patterns → HIGH (ask). Recoverable-but-consequential.
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
@@ -224,6 +239,10 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
 
   if (anyMatch(DENY_PATTERNS, full)) {
     return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['matches destructive pattern'] }
+  }
+
+  if (anyMatch(SYSTEM_CONFIG_DENY_PATTERNS, full)) {
+    return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['destructive host-config verb (stop/disable/unload/mask or crontab install)'] }
   }
 
   let risk = RISK.SAFE
