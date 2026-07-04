@@ -4,7 +4,13 @@
 
 ## Installation
 
-**The guard is generally installed and managed by the VAIBot CLI** — you don't normally install this package by hand:
+**The guard is generally installed and managed by the VAIBot CLI** — you don't normally install this package by hand. One command installs the `vaibot` CLI (macOS + Linux) and runs `vaibot init`, which installs and starts the guard as part of setup:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vaibot-io/command-cli/main/install.sh | sh
+```
+
+Once the CLI is present you can also drive the guard directly:
 
 ```bash
 vaibot init            # onboard + install the guard as part of setup
