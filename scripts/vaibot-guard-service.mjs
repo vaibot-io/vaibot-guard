@@ -1691,6 +1691,14 @@ const server = http.createServer(async (req, res) => {
       const risk = classifyRisk({ intent, cmd, args });
       const receiptTier = receiptTierForExec(cmd, args);
       const decision = decideExec({ sessionId, cmd, args, intent });
+      // Receipt honesty: fold the fine-grained classifier's risk into the coarse structural
+      // risk so risk_level reflects what actually drove the gate on EVERY decision path
+      // (approveToken / deny-token / catastrophic-floor), not only the allow/escalate
+      // returns. Same classify() inputs as decideExec, so risk matches the decision.
+      try {
+        const clsRisk = classify({ tool: "exec", input: { command: [cmd, ...(args || [])].join(" ") } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT }).risk;
+        risk.risk = mergeReceiptRisk(risk.risk, clsRisk);
+      } catch { /* keep coarse risk on classifier error */ }
       const runId = `run_${randomUUID()}`;
 
       const eventId = randomUUID();
@@ -1780,6 +1788,13 @@ const server = http.createServer(async (req, res) => {
 
       const risk = classifyToolRisk({ toolName, params, workspaceDir });
       const receiptTier = receiptTierForTool(toolName, params);
+      // Receipt honesty: fold the fine-grained classifier's risk into the coarse tool risk
+      // so risk_level matches the decision on every path (see the exec handler note). Same
+      // classify() inputs as decideTool.
+      try {
+        const clsRisk = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT }).risk;
+        risk.risk = mergeReceiptRisk(risk.risk, clsRisk);
+      } catch { /* keep coarse risk on classifier error */ }
 
       const paramsHash = `sha256:${sha256(stableStringify({ toolName, params }))}`;
       const approvalId = String(input?.approval?.approvalId || "");
