@@ -1101,7 +1101,19 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return Promise.resolve(null);
 
   const toolName = String(intent?.toolName || intent?.tool || intent?.cmd?.split(" ")[0] || "unknown");
-  const command = String(intent?.cmd || intent?.command || toolName).slice(0, 500);
+  // Tool-call intents carry `params`, not a cmd/command string, so `command` used to
+  // fall through to the bare tool name — a receipt read `command: "Write"` with no
+  // indication of WHICH file was written. That left `cwd` (the agent's process cwd)
+  // as the only location on the receipt, which for a file mutation is not where the
+  // action landed, making receipts look misattributed. Name the target explicitly,
+  // using the same extractor decideTool uses for the boundary check so the receipt
+  // reports exactly what the decision governed.
+  const targets = extractPathsFromToolParams(intent?.params).map((p) => collapseHome(String(p)));
+  const command = String(
+    intent?.cmd ||
+    intent?.command ||
+    (targets.length ? `${toolName} ${targets.join(" ")}` : toolName),
+  ).slice(0, 500);
   const cwd = collapseHome(String(intent?.workspaceDir || intent?.cwd || "/"));
 
   const guardDecision = String(decision?.decision || "deny");
