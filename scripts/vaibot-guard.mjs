@@ -174,8 +174,18 @@ if (!command || command === "-h" || command === "--help") {
 const flags = parseArgs(rest);
 const sessionId = process.env.VAIBOT_SESSION_ID || process.env.OPENCLAW_SESSION_KEY || process.env.OPENCLAW_SESSION || "unknown-session";
 
+/** Read all of stdin as a string. Returns "" when stdin is a TTY (nothing piped). */
+async function readStdin() {
+  if (process.stdin.isTTY) return "";
+  let raw = "";
+  for await (const chunk of process.stdin) raw += chunk;
+  return raw;
+}
+
 async function maybeOnboard() {
-  if (command === "configure") return;
+  // `classify` is a pure, offline query used on degraded paths where the daemon
+  // may be down — it must never prompt, write an env file, or restart a unit.
+  if (command === "configure" || command === "classify") return;
 
   // Only prompt in interactive terminals.
   if (!process.stdin.isTTY) return;
@@ -521,7 +531,67 @@ if (command === "configure") {
 
 await maybeOnboard();
 
-if (command === "precheck") {
+if (command === "classify") {
+  // One-shot, offline risk classification.
+  //
+  // WHY: every circuit-breaker plugin falls back to the local classifier when the
+  // daemon is unreachable — that fallback IS the safety floor. The classifier is
+  // Node, so a non-Node host (the Hermes Python plugin) could only reach it by
+  // reimplementing it, which would mean two implementations of the floor drifting
+  // apart. This exposes the real one instead. No daemon, no network, no writes —
+  // "daemon down" does not imply "node missing", so this still answers.
+  //
+  //   echo '{"toolName":"Bash","params":{"command":"rm -rf /"}}' | vaibot-guard classify
+  //   vaibot-guard classify --intent '{"tool":"Write","input":{"file_path":"/etc/hosts"}}'
+  //
+  // stdout: the classifier verdict. Callers read `verdictHint` (allow|ask|deny).
+  // Exit 0 = classified. Exit 2 = could not classify — callers MUST treat that as
+  // a failure to answer and fall back to their own fail-closed posture, never as
+  // an allow.
+  const { classify } = await import("./classifier.mjs");
+
+  const raw = flags.intent ? String(flags.intent) : await readStdin();
+  if (!String(raw).trim()) {
+    die("classify: provide an intent on stdin or via --intent '<json>'");
+  }
+
+  let intent;
+  try {
+    intent = JSON.parse(raw);
+  } catch (e) {
+    die(`classify: invalid JSON intent — ${e?.message || e}`);
+  }
+  if (!intent || typeof intent !== "object") die("classify: intent must be a JSON object");
+
+  // Accept both shapes: the classifier's native {tool,input} and the wire shape
+  // {toolName,params} that /v1/decide/tool already speaks, so a caller holding a
+  // decide payload can pass it straight through without reshaping.
+  const tool = intent.tool ?? intent.toolName;
+  const input = intent.input ?? intent.params;
+  if (typeof tool !== "string" || !tool.trim()) {
+    die("classify: intent requires a non-empty `tool` (or `toolName`)");
+  }
+
+  // escalateAt lets a caller reproduce a preset's ask threshold; omitted means the
+  // classifier's own default. guardPort feeds the guard self-protection patterns.
+  const escalateAt = flags["escalate-at"] ?? flags.escalateAt ?? intent.escalateAt;
+
+  let verdict;
+  try {
+    verdict = classify(
+      { tool, input },
+      { ...(escalateAt ? { escalateAt: String(escalateAt) } : {}), guardPort: GUARD_PORT },
+    );
+  } catch (e) {
+    // Never emit a partial or guessed verdict — an unusable answer must look like
+    // a failure so the caller falls back to fail-closed instead of reading a
+    // missing verdictHint as "allow".
+    die(`classify: classifier error — ${e?.message || e}`, 2);
+  }
+
+  process.stdout.write(JSON.stringify(verdict) + "\n");
+  process.exit(0);
+} else if (command === "precheck") {
   const intent = parseJsonFlag("intent", flags.intent);
 
   // For now, we decide based on the actual command you intend to run.

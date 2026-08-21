@@ -43,6 +43,22 @@ A local HTTP service that gates agent tool calls and writes a **tamper-evident a
 
 When `VAIBOT_GUARD_TOKEN` is set, protected endpoints require `Authorization: Bearer <token>`.
 
+## Offline classification (`vaibot-guard classify`)
+
+A one-shot risk classification with **no daemon, no network and no credentials** — the same classifier the daemon uses, exposed for callers that need the safety floor while the daemon is unreachable.
+
+```bash
+echo '{"toolName":"Bash","params":{"command":"…"}}' | vaibot-guard classify
+vaibot-guard classify --intent '{"tool":"Write","input":{"file_path":"/etc/hosts"}}'
+vaibot-guard classify --escalate-at high --intent '…'   # apply a preset's ask threshold
+```
+
+Accepts either the classifier's native `{tool, input}` or the `{toolName, params}` wire shape `/v1/decide/tool` already speaks. Writes the verdict to stdout; callers read **`verdictHint`** (`allow` | `ask` | `deny`).
+
+**Exit 0** means classified. **Any non-zero exit prints no verdict at all** — treat it as a failure to answer and fall back to your own fail-closed posture, never as an allow.
+
+This exists so non-Node hosts (e.g. a Python plugin) reach the *real* floor instead of reimplementing the classifier and drifting from it. "Daemon down" does not imply "node missing", so this still answers on the degraded path.
+
 ## Per-host enforcement (circuit-breaker plugins)
 
 The guard makes the decisions; a per-host **circuit-breaker plugin** intercepts tool calls and routes them to the guard, so enforcement happens at the host boundary rather than relying on the model to behave. Wire the plugin for your agent with:
