@@ -65,6 +65,26 @@ Accepts either the classifier's native `{tool, input}` or the `{toolName, params
 
 This exists so non-Node hosts (e.g. a Python plugin) reach the *real* floor instead of reimplementing the classifier and drifting from it. "Daemon down" does not imply "node missing", so this still answers on the degraded path.
 
+## Account bootstrap (`vaibot-guard bootstrap`)
+
+Provisions a free-tier account for a machine with no API key and saves it to `~/.vaibot/credentials.json`, the store every breaker on the machine shares. It exists so non-Node hosts don't grow a second writer for that file.
+
+```bash
+vaibot-guard bootstrap --agent hermes [--timeout-ms 10000]
+```
+
+stdout is one JSON line, and **never contains the key**; the caller re-reads it from the store:
+
+| Output | Meaning |
+|---|---|
+| `{"ok":true,"env":"…","provisioned":true,"wallet_address":"0x…","wallet_network":"…"}` | New account; key saved |
+| `{"ok":true,"env":"…","provisioned":false,"reason":"key-present"}` | A key already resolves; no network call was made |
+| `{"ok":true,"env":"…","provisioned":false,"reason":"account-exists"}` | This machine already has an account but the local key is gone; recover with `vaibot login` |
+
+**Any non-zero exit prints nothing on stdout.** Treat it as a failure to answer and fall back to your keyless posture.
+
+The fingerprint is `sha256(user@host)`, the same one every breaker sends, so a machine keeps one identity whichever breaker provisions it first. Credential resolution applies the production URL-override gate, so an injected `VAIBOT_GOVERNANCE_URL` can't redirect provisioning without `VAIBOT_ALLOW_URL_OVERRIDE`. A key issued for a different environment than the one being provisioned is refused rather than saved.
+
 ## Per-host enforcement (circuit-breaker plugins)
 
 The guard makes the decisions; a per-host **circuit-breaker plugin** intercepts tool calls and routes them to the guard, so enforcement happens at the host boundary rather than relying on the model to behave. Wire the plugin for your agent with:

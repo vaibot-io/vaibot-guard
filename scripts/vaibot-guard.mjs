@@ -167,7 +167,7 @@ function parseJsonFlag(name, value) {
 
 const [command, ...rest] = process.argv.slice(2);
 if (!command || command === "-h" || command === "--help") {
-  console.log(`vaibot-guard (MVP)\n\nCommands:\n  install-local\n  configure [--env_file <path>]\n  precheck --intent '<json>'\n  exec --intent '<json>' -- <command...>\n  finalize --run_id <id> --result '<json>'\n  flush [--session_id <id>]\n  proof --session_id <id> --index <n> --checkpoint_seq <n>\n\nNotes:\n  - CLI reads VAIBOT_GUARD_TOKEN/PORT from env or from ${ENV_FILE}\n`);
+  console.log(`vaibot-guard (MVP)\n\nCommands:\n  install-local\n  configure [--env_file <path>]\n  classify [--intent '<json>'] [--escalate-at <risk>]   (or intent on stdin)\n  bootstrap --agent <name> [--timeout-ms <n>]\n  precheck --intent '<json>'\n  exec --intent '<json>' -- <command...>\n  finalize --run_id <id> --result '<json>'\n  flush [--session_id <id>]\n  proof --session_id <id> --index <n> --checkpoint_seq <n>\n\nNotes:\n  - CLI reads VAIBOT_GUARD_TOKEN/PORT from env or from ${ENV_FILE}\n`);
   process.exit(0);
 }
 
@@ -185,7 +185,9 @@ async function readStdin() {
 async function maybeOnboard() {
   // `classify` is a pure, offline query used on degraded paths where the daemon
   // may be down — it must never prompt, write an env file, or restart a unit.
-  if (command === "configure" || command === "classify") return;
+  // `bootstrap` is called by a breaker from inside an agent: same constraint,
+  // and its only write is the credential store it exists to populate.
+  if (command === "configure" || command === "classify" || command === "bootstrap") return;
 
   // Only prompt in interactive terminals.
   if (!process.stdin.isTTY) return;
@@ -530,6 +532,85 @@ if (command === "configure") {
 }
 
 await maybeOnboard();
+
+if (command === "bootstrap") {
+  // One-shot account provisioning for a breaker that has no API key.
+  //
+  // WHY here: ~/.vaibot/credentials.json is shared by every breaker on the
+  // machine, and creds.mjs is its single writer — merge-on-write per env, legacy
+  // format migration, atomic rename. A non-Node host (the Hermes Python plugin)
+  // calls this rather than growing a second writer in a second language.
+  //
+  //   vaibot-guard bootstrap --agent hermes
+  //
+  // stdout (exit 0) is one JSON line. It never carries the key: the caller
+  // re-reads it from the store, so the secret doesn't cross a process boundary.
+  //   {"ok":true,"env":"…","provisioned":true,"wallet_address":"0x…","wallet_network":"…"}
+  //   {"ok":true,"env":"…","provisioned":false,"reason":"key-present"}     no network call made
+  //   {"ok":true,"env":"…","provisioned":false,"reason":"account-exists"}  this machine has an
+  //       account but the local key is gone — recover with `vaibot login`
+  // Any non-zero exit prints nothing on stdout: the caller could not get an
+  // answer and must fall back to its own keyless posture.
+  const { migrateFileIfNeeded, resolveCredentials, saveCredsForEnv, keyPrefixMatchesEnv } = await import("./lib/creds.mjs");
+
+  const agent = typeof flags.agent === "string" ? flags.agent.trim() : "";
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(agent)) die("bootstrap: --agent <name> is required (e.g. --agent hermes)");
+  const timeoutMs = Number(flags["timeout-ms"]) > 0 ? Number(flags["timeout-ms"]) : 10000;
+
+  migrateFileIfNeeded();
+  // resolveCredentials applies the §5 gate: a production URL override is
+  // ignored unless VAIBOT_ALLOW_URL_OVERRIDE is set, so an injected env var
+  // can't redirect provisioning to a host of its choosing.
+  const resolved = resolveCredentials();
+  const answer = (fields) => {
+    process.stdout.write(JSON.stringify({ ok: true, env: resolved.env, ...fields }) + "\n");
+    process.exit(0);
+  };
+
+  if (resolved.apiKey) answer({ provisioned: false, reason: "key-present" });
+
+  // The fingerprint every breaker sends: one account per user@host, whichever
+  // breaker gets there first, so a machine never forks into several identities.
+  const fingerprint = createHash("sha256").update(`${os.userInfo().username}@${os.hostname()}`).digest("hex");
+
+  let res;
+  try {
+    res = await fetch(`${resolved.apiBaseUrl}/v2/bootstrap`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fingerprint, agent }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    die(`bootstrap: ${resolved.apiBaseUrl} unreachable — ${e?.message || e}`);
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    die(`bootstrap: server returned ${res.status} ${text.slice(0, 200)}`);
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    die("bootstrap: server returned invalid JSON");
+  }
+
+  if (typeof data?.api_key === "string" && data.api_key) {
+    // A key for the wrong env would be stored, then ignored by every reader
+    // (keyMismatch), and bootstrap would run again on every call. Refuse it.
+    if (!keyPrefixMatchesEnv(data.api_key, resolved.env)) {
+      die(`bootstrap: server issued a key for a different environment than ${resolved.env} — not saved`);
+    }
+    saveCredsForEnv(resolved.env, { api_key: data.api_key, wallet_address: data.wallet_address });
+    answer({
+      provisioned: true,
+      wallet_address: typeof data.wallet_address === "string" ? data.wallet_address : null,
+      wallet_network: typeof data.wallet_network === "string" ? data.wallet_network : null,
+    });
+  }
+  if (data?.bootstrapped === false) answer({ provisioned: false, reason: "account-exists" });
+  die("bootstrap: server answered with neither a key nor an existing account");
+}
 
 if (command === "classify") {
   // One-shot, offline risk classification.
