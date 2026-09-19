@@ -566,11 +566,20 @@ function hashCheckpoint(data) {
 }
 
 // Deterministic JSON serialization (stable key order) for hashing.
+// Values JSON can't hold follow JSON.stringify: an undefined (or function)
+// property is omitted, and becomes null inside an array. Emitting the literal
+// text `undefined` instead made the output invalid JSON — a run context written
+// that way read back as null (its receipt lost the whole intent), and an audit
+// line written that way can't be parsed.
 function stableStringify(value) {
   if (value === null || value === undefined) return JSON.stringify(value);
   if (typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return "[" + value.map((v) => stableStringify(v)).join(",") + "]";
-  const keys = Object.keys(value).sort();
+  if (Array.isArray(value)) {
+    return "[" + value.map((v) => (v === undefined || typeof v === "function" ? "null" : stableStringify(v))).join(",") + "]";
+  }
+  const keys = Object.keys(value)
+    .filter((k) => value[k] !== undefined && typeof value[k] !== "function")
+    .sort();
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(value[k])).join(",") + "}";
 }
 
