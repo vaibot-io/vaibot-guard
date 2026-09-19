@@ -1113,7 +1113,7 @@ function postVaibotProve({ receipt, idempotencyKey }) {
  * base (e.g. https://api.vaibot.io) → POST {GOVERNANCE_BASE}/v2/receipts, the same
  * host/routing the effective-mode poll uses — never the V1 provenance host.
  */
-function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion }) {
+function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion, effectiveMode }) {
   if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return Promise.resolve(null);
 
   const toolName = String(intent?.toolName || intent?.tool || intent?.cmd?.split(" ")[0] || "unknown");
@@ -1143,7 +1143,25 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // stays low. This ends the "low-risk but gated" receipts.
   const riskLevel = mergeReceiptRisk(risk?.risk, decision?.risk);
 
-  const approvalStatus = guardDecision === "approve" ? "pending" : "not_required";
+  // Receipt honesty (approval resolution): this function runs ONLY from the
+  // finalize handlers, so a gated run that reaches here has already been
+  // answered — the human either approved it in the agent's native prompt (the
+  // tool then ran, and PostToolUse finalized) or rejected it (a sweep hook
+  // finalizes with approval:"denied"). Emitting the decide-time "pending" here
+  // is what left every approved action parked in the dashboard queue forever.
+  //
+  // Observe mode is the exception: nothing was enforced, so nobody was ever
+  // asked. The server keys shadow rows off observe_mode and filters them out
+  // of the pending queue, so keep the uniform "pending" and flag the mode
+  // instead of inventing a human decision that never happened.
+  const observing = normalizeMode(effectiveMode || EFFECTIVE_MODE) === "observe";
+  const humanDenied =
+    result?.approval === "denied" || result?.outcome === "denied_by_reviewer";
+
+  let approvalStatus = "not_required";
+  if (guardDecision === "approve") {
+    approvalStatus = observing ? "pending" : humanDenied ? "denied" : "approved";
+  }
 
   // #17: name the SIGNED policy bundle that governed this decision (decision-time
   // accurate, from the live F-157 state). Omitted under built-in defaults — the
@@ -1156,18 +1174,38 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // yet (result == null), so it is "allowed" — previously `result?.code !== 0` was true for a
   // null result, so every allowed action's precheck receipt read "blocked". Only downgrade to
   // "blocked" when a result is present AND the action actually failed (a finalize receipt).
+  const failed = result != null && (result.ok === false || (result.code != null && result.code !== 0));
   let outcome = "blocked";
   if (guardDecision === "allow") {
-    const failed = result != null && (result.ok === false || (result.code != null && result.code !== 0));
     outcome = failed ? "blocked" : "allowed";
   } else if (guardDecision === "approve") {
-    outcome = "blocked_until_approved";
+    // Denied → terminal. Approved → the action actually ran, so report what it
+    // did. Observe → never gated, so it ran too, but the mode flag carries the
+    // "this was not enforced" caveat.
+    if (humanDenied) outcome = "denied_by_reviewer";
+    else outcome = failed ? "blocked" : "allowed";
   }
 
   const agentId = String(sessionId || "unknown-session");
-  const actionVerb = mappedDecision === "deny" ? "blocked from executing" :
-    mappedDecision === "approval_required" ? "paused pending approval for" :
-    "executed";
+  const policyReason = String(decision?.reason || risk?.reason || "Policy decision");
+  const actionVerb =
+    mappedDecision === "deny" ? "blocked from executing" :
+    mappedDecision === "approval_required"
+      ? observing
+        ? "would have paused pending approval for"
+        : humanDenied
+          ? "was denied approval to run"
+          : "executed after approval"
+      : "executed";
+
+  // The gate is resolved by the time this receipt is written, so say what
+  // happened rather than restating the reason it was gated.
+  const resultSummary =
+    mappedDecision === "approval_required" && !observing
+      ? humanDenied
+        ? `Denied in the agent session — action did not run. ${policyReason}`
+        : `Approved in the agent session — action ran. ${policyReason}`
+      : policyReason;
 
   const receiptPayload = {
     run_id: runId,
@@ -1182,13 +1220,18 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
     policy: {
       risk_level: riskLevel,
       decision: mappedDecision,
-      reason: String(decision?.reason || risk?.reason || "Policy decision"),
+      reason: policyReason,
       ...(signedPolicyVersion ? { policy_version: signedPolicyVersion } : {}),
     },
     approval: { status: approvalStatus },
+    // The server filters observe-mode shadow rows out of the pending queue by
+    // this flag. The guard never sent it, so every shadow decision was stored
+    // observe_mode=false and surfaced as a live approval the user had to act
+    // on — for an account in observe mode, that is the whole pending queue.
+    observe_mode: observing,
     result: {
       outcome,
-      summary: String(decision?.reason || outcome),
+      summary: resultSummary,
     },
   };
 
@@ -1792,7 +1835,9 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Store context for finalize (persisted).
-      writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version });
+      // effectiveMode is captured at DECIDE time: the mode that actually
+      // governed this action, not whatever the poll has drifted to by finalize.
+      writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version, effectiveMode: EFFECTIVE_MODE });
 
       return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE });
     }
@@ -1956,6 +2001,7 @@ const server = http.createServer(async (req, res) => {
         precheckAudit: audit,
         ts: nowIso(),
         policyVersion: POLICY.version,
+        effectiveMode: EFFECTIVE_MODE,
       });
 
       return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE });
@@ -2023,6 +2069,14 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // A rejected gate is terminal: burn the local approval record so a retry
+      // of the same intent cannot redeem an approval the user just refused.
+      // Best-effort — an already-expired/used record simply has nothing to do.
+      if (result?.approval === "denied" && ctx1?.decision?.approvalId) {
+        try { resolveApproval({ approvalId: ctx1.decision.approvalId, action: "deny" }); }
+        catch { /* already resolved or expired */ }
+      }
+
       // M: a tier-2 governance receipt is earned, not automatic. Only egress/network
       // or high/dangerous calls get a signed receipt; ledger-tier calls are already
       // covered by the tier-1 Merkle ledger above. Missing tier => emit (fail-safe:
@@ -2038,6 +2092,7 @@ const server = http.createServer(async (req, res) => {
           risk: ctx1?.risk,
           result,
           policyVersion: ctx1?.policyVersion,
+          effectiveMode: ctx1?.effectiveMode,
         }).catch((e) => console.error(`[vaibot-guard] governance receipt post failed (tool): ${e?.message || e}`));
       }
 
@@ -2130,6 +2185,7 @@ const server = http.createServer(async (req, res) => {
           risk: ctx1?.risk,
           result,
           policyVersion: ctx1?.policyVersion,
+          effectiveMode: ctx1?.effectiveMode,
         }).catch((e) => console.error(`[vaibot-guard] governance receipt post failed (exec): ${e?.message || e}`));
       }
 
