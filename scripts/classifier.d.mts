@@ -66,6 +66,10 @@ export interface ClassifyResult {
   reasons: string[]
 }
 
+export type ToolKind = 'exec' | 'read' | 'write' | 'search' | 'network'
+
+/** Active tables first, then the built-in host vocabulary; null when unrecognised. */
+export function toolKind(tool: string, tables?: ClassifierTables): ToolKind | null
 export function classifyBash(command: string, tables?: ClassifierTables): BashClassification
 export function verdictForRisk(risk: Risk): Verdict
 export function receiptTierFor(risk: Risk, boundary: Boundary): ReceiptTier

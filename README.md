@@ -43,6 +43,12 @@ A local HTTP service that gates agent tool calls and writes a **tamper-evident a
 
 When `VAIBOT_GUARD_TOKEN` is set, protected endpoints require `Authorization: Bearer <token>`.
 
+`/health` also returns `capabilities`, a list of what this daemon's decisions understand, so a client can adapt without comparing versions. Read it from the live daemon, never from the rendezvous lock, which can outlive the process that wrote it.
+
+| Capability | Meaning |
+|---|---|
+| `host-vocab:hermes` | Hermes tool names (`terminal`, `write_file`, `patch`, `read_file`, `search_files`, `web_extract`) are classified natively; a client may send them as-is. |
+
 ## Offline classification (`vaibot-guard classify`)
 
 A one-shot risk classification with **no daemon, no network and no credentials** — the same classifier the daemon uses, exposed for callers that need the safety floor while the daemon is unreachable.

@@ -15,7 +15,7 @@ import https from "node:https";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { classify } from "./classifier.mjs";
+import { classify, toolKind } from "./classifier.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
@@ -110,6 +110,15 @@ const GUARD_VERSION = process.env.VAIBOT_GUARD_VERSION || (() => {
   }
 })();
 const INSTANCE_ID = randomUUID();
+
+// What this daemon's decisions understand, surfaced on /health so a client can
+// adapt without version arithmetic (forks and pre-releases make that
+// unreliable). Clients must read it from the LIVE daemon, never from the
+// rendezvous lock, which can outlive the process that wrote it. Only daemon
+// behaviour belongs here — a CLI on PATH may be a different install.
+//   host-vocab:hermes — Hermes tool names (terminal, write_file, …) are
+//                       classified natively, so a client may send them as-is.
+const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes"]);
 
 const VAIBOT_LOG_RETENTION_DAYS = Math.max(1, Number(process.env.VAIBOT_LOG_RETENTION_DAYS || 14));
 
@@ -911,6 +920,10 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
 
   const tn = String(toolName || "").toLowerCase();
   const url = extractUrlFromToolParams(params);
+  // The classifier's tool kind covers host vocabularies the name heuristics below
+  // miss (write_file, patch, web_extract). Exec is deliberately NOT keyed off it:
+  // that would rate every `ls` high and undo the low-risk receipt tier.
+  const kind = toolKind(tn, CLASSIFIER_TABLES);
 
   // Network tools
   if (url && /^(https?:)?\/\//i.test(url)) {
@@ -919,7 +932,7 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
       ? { risk: "high", reason: "network destination present (allowlisted)" }
       : { risk: "high", reason: "network destination not allowlisted" };
   }
-  if (tn.includes("web_fetch") || tn.includes("browser") || tn.includes("fetch")) {
+  if (kind === "network" || tn.includes("web_fetch") || tn.includes("browser") || tn.includes("fetch")) {
     return { risk: "high", reason: "network/browsing tool" };
   }
 
@@ -933,8 +946,8 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
     return { risk: "high", reason: "execution tool" };
   }
 
-  // File mutations (heuristic by tool name)
-  if (/(^|\b)(write|edit|patch|apply|delete|rm|mkdir|upload)(\b|$)/i.test(tn)) {
+  // File mutations (classifier kind, else heuristic by tool name)
+  if (kind === "write" || /(^|\b)(write|edit|patch|apply|delete|rm|mkdir|upload)(\b|$)/i.test(tn)) {
     return { risk: "high", reason: "file mutation tool" };
   }
 
@@ -996,8 +1009,11 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
     return { decision: "allow", reason: "Allowlisted network destination" };
   }
 
-  // File mutation: deny/approve based on workspace boundary + denied paths.
-  if (/(^|\b)(write|edit|delete|upload)(\b|$)/i.test(lower)) {
+  // File mutation: deny/approve based on workspace boundary + denied paths. Keyed
+  // off the classifier's tool kind as well as the name: the name regex needs
+  // `write`/`edit` as a whole word, so write_file, patch, MultiEdit, NotebookEdit
+  // and apply_patch all slipped past it and were never boundary-checked.
+  if (toolKind(tn, CLASSIFIER_TABLES) === "write" || /(^|\b)(write|edit|delete|upload)(\b|$)/i.test(lower)) {
     const paths = extractPathsFromToolParams(params);
     for (const p of paths) {
       const r = resolveIntentPath(p, workspaceDir);
@@ -1537,7 +1553,7 @@ function appendAudit(event) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
-      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE });
+      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE, capabilities: GUARD_CAPABILITIES });
     }
 
     // Read-only view of the active signed policy + provenance (F-155). Like
