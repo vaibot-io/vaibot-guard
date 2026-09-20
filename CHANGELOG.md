@@ -2,6 +2,27 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
+## [2.2.0] — 2026-09-20 — per-account policy
+
+### Added
+- **The guard fetches its OWN account's policy.** `GET /v2/policy` now answers
+  with the caller's effective policy — the admin-set global default plus
+  whatever that account changed for itself — when the request carries an API
+  key, and with the global default when it doesn't. The guard sends its key, so
+  a per-account policy reaches the machine it governs. The key travels only to
+  the control plane the guard already trusts with it; a `VAIBOT_POLICY_URL`
+  pinned at another host is still fetched, just unauthenticated, since the
+  Ed25519 signature is the trust anchor either way.
+- **Reports what it is running.** The `/v2/accounts/me` poll carries
+  `x-vaibot-guard-version` and `x-vaibot-policy-version`, so the control plane
+  can tell an account that a policy it just set is not enforced yet. This is
+  the release the API names as its `min_guard_version`.
+
+### Changed
+- A rejected key on the policy fetch is fail-static, like every other fetch
+  failure: an account whose own policy is tighter than the global default is
+  never loosened to the default because its key was revoked.
+
 ## [2.1.1] — 2026-07-04
 
 ### Docs
