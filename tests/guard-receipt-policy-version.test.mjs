@@ -93,6 +93,12 @@ test("#17: the guard's governance receipt carries the signed policy_version", as
       // from VAIBOT_GOVERNANCE_URL (not the deprecated VAIBOT_API_URL → provenance).
       VAIBOT_GOVERNANCE_URL: `http://127.0.0.1:${sinkPort}`,
       VAIBOT_API_KEY: "test-key",
+      // Without this the env resolves to production, where the §5 gate drops the
+      // governance override and receipts leave for the canonical host — so the
+      // test only passed when the developer's own credentials file said
+      // otherwise. Guard tests run under an isolated HOME (they write
+      // ~/.vaibot/guard/guard.json), so it must say so itself.
+      VAIBOT_ENV: "staging",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
