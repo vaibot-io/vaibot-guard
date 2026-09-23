@@ -390,6 +390,31 @@ function normalizeMode(m) {
 }
 let EFFECTIVE_MODE = normalizeMode(process.env.VAIBOT_MODE || "enforce");
 
+// ---- Containment switch (Tier-0) --------------------------------------------
+// When ARMED, every decision short-circuits to a floor-deny BEFORE policy/classifier:
+//  * `floor:true` ⇒ it holds even in observe (clients enforce Tier-0 regardless of mode);
+//  * pre-classifier ⇒ independent of a fetchable/correct/signed policy — it fires even when
+//    the control plane is unreachable or the policy is empty/compromised.
+// NO local arming lever (no env var, no agent-reachable file): a local toggle would be an
+// escape hatch and conflicts with "the control plane is the chokepoint" (worse here because the
+// guard is often self-spawned by the plugin). The flag is set ONLY by adopting the
+// server-authoritative `enforcement.contained` from the /me poll (adoptContainment) — one
+// source of truth. A later phase drives it from the control-plane lease (guard.json
+// valid_until) + a fast incident poll.
+let CONTAINMENT_ARMED = false;
+function containmentDecision() {
+  return { decision: "deny", reason: "VAIBot containment engaged — all actions blocked (Tier-0).", floor: true };
+}
+// FAIL-STATIC: only an explicit boolean flips containment; a malformed/absent value keeps the
+// last-known state so a transient poll blip can never silently LIFT containment.
+function adoptContainment(v, source) {
+  if (typeof v !== "boolean") return false;
+  if (v === CONTAINMENT_ARMED) return false;
+  CONTAINMENT_ARMED = v;
+  console.error(`[vaibot-guard] containment ${v ? "ARMED" : "cleared"} (${source}).`);
+  return true;
+}
+
 // Re-stamp guard.json with the current mode (only if WE still own the lock) so
 // offline readers (CLI, gateway) see a live value without issuing a decide call.
 function republishMode() {
@@ -434,6 +459,9 @@ async function refreshEffectiveMode() {
     if (!res.ok) return; // transient/auth blip → fail-static
     const data = await res.json().catch(() => null);
     if (!data) return;
+    // Adopt containment independently of mode validity — a malformed effective_mode below
+    // must NOT cause us to skip a control-plane `contained` signal.
+    adoptContainment(data?.enforcement?.contained, "control plane");
     // Apply a deferred prod override only for an admin; otherwise leave it on canonical.
     if (PROD_OVERRIDE_PENDING) {
       if (data.admin === true) {
@@ -917,6 +945,7 @@ function applyHostBypass(decision, hostBypass) {
 }
 
 function decideExec({ sessionId, cmd, args, intent }) {
+  if (CONTAINMENT_ARMED) return containmentDecision();
   const err = validateIntent(intent);
   if (err) return { decision: "deny", reason: err, ruleId: "intent-invalid" };
 
@@ -1095,6 +1124,7 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
 }
 
 function decideTool({ sessionId, toolName, params, workspaceDir }) {
+  if (CONTAINMENT_ARMED) return containmentDecision();
   const tn = String(toolName || "");
   // Fail-closed: an unidentified tool call cannot be governed → deny.
   if (!tn.trim()) return { decision: "deny", reason: "Missing tool name", ruleId: "tool-missing" };
@@ -1773,7 +1803,7 @@ function appendAudit(event) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
-      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE, capabilities: GUARD_CAPABILITIES });
+      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE, capabilities: GUARD_CAPABILITIES, contained: CONTAINMENT_ARMED });
     }
 
     // Read-only view of the active signed policy + provenance (F-155). Like
@@ -2019,7 +2049,7 @@ const server = http.createServer(async (req, res) => {
       // governed this action, not whatever the poll has drifted to by finalize.
       writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version, effectiveMode: EFFECTIVE_MODE, hostBypass });
 
-      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION });
+      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION, contained: CONTAINMENT_ARMED });
     }
 
     if (req.method === "POST" && req.url === "/v1/decide/tool") {
@@ -2188,7 +2218,7 @@ const server = http.createServer(async (req, res) => {
         hostBypass,
       });
 
-      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION });
+      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION, contained: CONTAINMENT_ARMED });
     }
 
     if (req.method === "POST" && req.url === "/v1/finalize/tool") {
