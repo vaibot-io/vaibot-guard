@@ -74,11 +74,31 @@ test("#17: the guard's governance receipt carries the signed policy_version", as
   const bundlePath = path.join(logDir, "policy.bundle.json");
   fs.writeFileSync(bundlePath, JSON.stringify(bundle));
 
+  // Isolate credentials. Run on a machine that holds real PRODUCTION creds and
+  // the guard refuses the VAIBOT_GOVERNANCE_URL override (admin-gated, v3 §5):
+  // the receipt then goes to the canonical host, the sink stays empty, and this
+  // test fails for a reason that has nothing to do with policy_version.
+  const home = path.join(tmpRoot, "pv-home");
+  fs.mkdirSync(path.join(home, ".vaibot"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".vaibot", "credentials.json"),
+    JSON.stringify({
+      version: 3,
+      active_env: "staging",
+      environments: { staging: { api_key: "vb_test_key" } },
+    }),
+  );
+
   const port = 49200 + Math.floor(Math.random() * 1500);
   const token = "pv-token";
   const guard = spawn(process.execPath, [SERVICE_PATH], {
     env: {
       ...process.env,
+      HOME: home,
+      // creds dir resolves via os.homedir()/$VAIBOT_CREDS_DIR (NOT $HOME) — pin it.
+      VAIBOT_CREDS_DIR: path.join(home, ".vaibot"),
+      VAIBOT_ENV: "",
+      VAIBOT_API_URL: "",
       VAIBOT_GUARD_HOST: "127.0.0.1",
       VAIBOT_GUARD_PORT: String(port),
       VAIBOT_GUARD_TOKEN: token,

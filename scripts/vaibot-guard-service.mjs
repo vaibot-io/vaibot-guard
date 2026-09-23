@@ -15,7 +15,7 @@ import https from "node:https";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { classify } from "./classifier.mjs";
+import { classify, toolKind } from "./classifier.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
@@ -111,6 +111,21 @@ const GUARD_VERSION = process.env.VAIBOT_GUARD_VERSION || (() => {
 })();
 const INSTANCE_ID = randomUUID();
 
+// What this daemon's decisions understand, surfaced on /health so a client can
+// adapt without version arithmetic (forks and pre-releases make that
+// unreliable). Clients must read it from the LIVE daemon, never from the
+// rendezvous lock, which can outlive the process that wrote it. Only daemon
+// behaviour belongs here — a CLI on PATH may be a different install.
+//   host-vocab:hermes — Hermes tool names (terminal, write_file, …) are
+//                       classified natively, so a client may send them as-is.
+//   host-bypass       — decide accepts `hostBypass: {active, mechanism}` and
+//                       applies the policy's hostBypassAction itself, so a
+//                       client should report the host's bypass state rather
+//                       than enforce its own default.
+//   rule-id           — escalations and denials carry `decision.ruleId`, the
+//                       policy rule (and subject) that fired.
+const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id"]);
+
 const VAIBOT_LOG_RETENTION_DAYS = Math.max(1, Number(process.env.VAIBOT_LOG_RETENTION_DAYS || 14));
 
 const WORKSPACE = process.env.VAIBOT_WORKSPACE || process.cwd();
@@ -136,7 +151,10 @@ function loadPolicy() {
     const redactEnvKeyPatterns = Array.isArray(j.redactEnvKeyPatterns) ? j.redactEnvKeyPatterns.map(String) : [];
     const fileMutationOutsideWorkspaceAction = (j.fileMutationOutsideWorkspaceAction === "approve" ? "approve" : "deny");
     const fileMutationDeniedPathAction = (j.fileMutationDeniedPathAction === "approve" ? "approve" : "deny");
-    return { version: String(j.version || ""), denyTokens, approveTokens, allowlistedDomains, denyPaths, redactPatterns, redactEnvKeyPatterns, fileMutationOutsideWorkspaceAction, fileMutationDeniedPathAction };
+    // Tighten-only: a local "deny" overrides a signed "approve"; nothing local
+    // can loosen it, so any other value is simply no opinion.
+    const hostBypassAction = j.hostBypassAction === "deny" ? "deny" : undefined;
+    return { version: String(j.version || ""), denyTokens, approveTokens, allowlistedDomains, denyPaths, redactPatterns, redactEnvKeyPatterns, fileMutationOutsideWorkspaceAction, fileMutationDeniedPathAction, hostBypassAction };
   } catch (e) {
     // fail closed if policy cannot be loaded
     console.error(`[vaibot-guard] failed to load policy from ${VAIBOT_POLICY_PATH}: ${e?.message || e}`);
@@ -209,6 +227,7 @@ let SIGNED_ESCALATE_AT;   // SIGNED_POLICY.escalateAt — per-preset ask thresho
 let SIGNED_DENYPATHS;     // SIGNED_POLICY.denyPaths — unioned onto local DENY_PATHS
 let EFFECTIVE_FILEMUT_ACTION = FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION; // local ∪ signed (deny wins)
 let CLASSIFIER_TABLES; // SIGNED_POLICY.classifierTables, after the G-163 safety gate
+let EFFECTIVE_HOST_BYPASS_ACTION = "deny"; // signed decides; a local policy file can only tighten
 
 function applyLoadedBundle(loadResult) {
   POLICY_BUNDLE = loadResult;
@@ -229,6 +248,10 @@ function applyLoadedBundle(loadResult) {
     tables = undefined;
   }
   CLASSIFIER_TABLES = tables;
+  // Honouring a host's approval bypass is a loosening, so only a verified bundle
+  // can turn it on, and an operator's local policy file can still turn it off.
+  EFFECTIVE_HOST_BYPASS_ACTION =
+    SIGNED_POLICY.hostBypassAction === "approve" && POLICY.hostBypassAction !== "deny" ? "approve" : "deny";
 }
 
 // F (distribution + F-157 refresh): pull the active signed bundle from the
@@ -557,11 +580,20 @@ function hashCheckpoint(data) {
 }
 
 // Deterministic JSON serialization (stable key order) for hashing.
+// Values JSON can't hold follow JSON.stringify: an undefined (or function)
+// property is omitted, and becomes null inside an array. Emitting the literal
+// text `undefined` instead made the output invalid JSON — a run context written
+// that way read back as null (its receipt lost the whole intent), and an audit
+// line written that way can't be parsed.
 function stableStringify(value) {
   if (value === null || value === undefined) return JSON.stringify(value);
   if (typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return "[" + value.map((v) => stableStringify(v)).join(",") + "]";
-  const keys = Object.keys(value).sort();
+  if (Array.isArray(value)) {
+    return "[" + value.map((v) => (v === undefined || typeof v === "function" ? "null" : stableStringify(v))).join(",") + "]";
+  }
+  const keys = Object.keys(value)
+    .filter((k) => value[k] !== undefined && typeof value[k] !== "function")
+    .sort();
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(value[k])).join(",") + "}";
 }
 
@@ -784,18 +816,71 @@ function mergeReceiptRisk(coarse, classifierRisk) {
   return LEVELS[Math.max(0, Math.min(3, Math.max(c, k)))];
 }
 
+// Stable id for the policy rule behind a decision. A host keys its "approve for
+// the rest of this session" grain off it, so it names the rule AND its subject
+// where the subject matters — approving writes to one directory, or traffic to
+// one host, must not approve every directory or every host.
+function ruleIdFor(kind, subject) {
+  const s = String(subject ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._~/-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+  return s ? `${kind}:${s}` : kind;
+}
+
+function hostOf(url) {
+  try {
+    return new URL(String(url)).hostname;
+  } catch {
+    return String(url || "");
+  }
+}
+
+function dirOf(p) {
+  return collapseHome(path.dirname(String(p || "")));
+}
+
+// A breaker reports whether its host is running with approvals switched off
+// (Hermes --yolo, Claude Code bypassPermissions, …). Only a literal `true`
+// counts; the mechanism is a short label for the receipt and is trusted for
+// nothing else.
+function parseHostBypass(raw) {
+  const active = raw?.active === true;
+  const m = typeof raw?.mechanism === "string" ? raw.mechanism.trim() : "";
+  return { active, mechanism: active && /^[a-z0-9][a-z0-9:._-]{0,63}$/i.test(m) ? m : null };
+}
+
+// Apply the policy's hostBypassAction to an escalation. While a bypass is active
+// the host grants any approval request before a human sees it, so an "approve"
+// verdict would silently become an allow. Only escalations change: a deny —
+// the catastrophic floor included — and an allow pass through untouched.
+function applyHostBypass(decision, hostBypass) {
+  if (!hostBypass.active || decision?.decision !== "approve") return decision;
+  if (EFFECTIVE_HOST_BYPASS_ACTION === "approve") return { ...decision, bypassOverride: true };
+  const via = hostBypass.mechanism ? ` (${hostBypass.mechanism})` : "";
+  return {
+    decision: "deny",
+    reason: `Approval bypass is active${via}, and policy blocks actions that need approval while it is. Needed approval for: ${decision.reason}`,
+    ...(decision.ruleId ? { ruleId: decision.ruleId } : {}),
+    ...(decision.risk !== undefined ? { risk: decision.risk } : {}),
+    bypassBlocked: true,
+  };
+}
+
 function decideExec({ sessionId, cmd, args, intent }) {
   const err = validateIntent(intent);
-  if (err) return { decision: "deny", reason: err };
+  if (err) return { decision: "deny", reason: err, ruleId: "intent-invalid" };
 
   const joined = [cmd, ...(args || [])].join(" ");
 
   // D: signed-policy denylist + classifier dangerous-deny (safety floor).
-  if (SIGNED_DENYLIST.includes(String(cmd))) return { decision: "deny", reason: "Denied by signed policy denylist" };
+  if (SIGNED_DENYLIST.includes(String(cmd))) return { decision: "deny", reason: "Denied by signed policy denylist", ruleId: ruleIdFor("denylist", cmd) };
   const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0) so clients
   // can enforce it even in observe mode.
-  if (clsExec.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${clsExec.reasons[0] || "dangerous"}`, floor: true };
+  if (clsExec.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${clsExec.reasons[0] || "dangerous"}`, floor: true, ruleId: ruleIdFor("floor", clsExec.reasons[0]) };
 
   // ---- File mutation posture (fail-closed)
   // If intent indicates filesystem mutation outside the workspace boundary or in a denied path,
@@ -807,31 +892,39 @@ function decideExec({ sessionId, cmd, args, intent }) {
     for (const p of mut) {
       const r = resolveIntentPath(p, intent.cwd);
       if (isDeniedPath(r.abs) || isDeniedPath(r.full)) {
+        const ruleId = ruleIdFor("file-denied-path", dirOf(r.full || r.abs));
         if (FILE_MUTATION_DENIED_PATH_ACTION === "approve") {
-          return { decision: "approve", reason: "File mutation touches denied path", approvalId: `appr_${randomUUID()}` };
+          return { decision: "approve", reason: "File mutation touches denied path", approvalId: `appr_${randomUUID()}`, ruleId };
         }
-        return { decision: "deny", reason: "File mutation touches denied path" };
+        return { decision: "deny", reason: "File mutation touches denied path", ruleId };
       }
       if (r.unresolved || !isInsideWorkspace(r.full)) {
+        const ruleId = ruleIdFor("file-outside-workspace", dirOf(r.full || r.abs));
         if (EFFECTIVE_FILEMUT_ACTION === "approve") {
-          return { decision: "approve", reason: "File mutation outside workspace", approvalId: `appr_${randomUUID()}` };
+          return { decision: "approve", reason: "File mutation outside workspace", approvalId: `appr_${randomUUID()}`, ruleId };
         }
-        return { decision: "deny", reason: "File mutation outside workspace" };
+        return { decision: "deny", reason: "File mutation outside workspace", ruleId };
       }
     }
   }
 
   // ---- Token posture
   const deny = matchToken([...DENY_TOKENS, ...(SIGNED_DENYTOKENS || [])], joined);
-  if (deny) return { decision: "deny", reason: `Denied token: ${deny}` };
+  if (deny) return { decision: "deny", reason: `Denied token: ${deny}`, ruleId: ruleIdFor("token-deny", deny) };
 
   // ---- Network posture
   // If destinations present and not allowlisted, require approval.
   const dests = intent?.network?.destinations;
   if (Array.isArray(dests) && dests.length > 0) {
-    const anyNotAllowlisted = dests.some((d) => !isDomainAllowlisted(String(d)));
-    if (anyNotAllowlisted) {
-      return { decision: "approve", reason: "Network destination not allowlisted", approvalId: `appr_${randomUUID()}` };
+    const notAllowlisted = dests.filter((d) => !isDomainAllowlisted(String(d)));
+    if (notAllowlisted.length > 0) {
+      return {
+        decision: "approve",
+        reason: "Network destination not allowlisted",
+        approvalId: `appr_${randomUUID()}`,
+        // Several destinations share one approval only if they are the same set.
+        ruleId: ruleIdFor("network", notAllowlisted.map((d) => hostOf(d)).sort().join(",")),
+      };
     }
   }
 
@@ -845,11 +938,11 @@ function decideExec({ sessionId, cmd, args, intent }) {
   //    exfiltration threat-model note: secret reads are benign; exfil is the risk.)
   const signedApprove = matchToken(SIGNED_APPROVETOKENS || [], joined);
   if (signedApprove) {
-    return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}` };
+    return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}`, ruleId: ruleIdFor("token-approve", signedApprove) };
   }
   const builtinApprove = matchToken(APPROVE_TOKENS, joined);
   if (builtinApprove && clsExec.verdictHint !== "allow") {
-    return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}` };
+    return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}`, ruleId: ruleIdFor("token-approve", builtinApprove) };
   }
 
   // Fail-closed baseline: ONLY a classifier-safe action falls through to allow.
@@ -864,6 +957,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
     risk: clsExec.risk,
     reason: `Escalated for approval (${clsExec.risk}): ${clsExec.reasons?.[0] || "unrecognized command"}`,
     approvalId: `appr_${randomUUID()}`,
+    ruleId: ruleIdFor("classifier", `${clsExec.risk}:${clsExec.reasons?.[0] || "unrecognized command"}`),
   };
 }
 
@@ -911,6 +1005,10 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
 
   const tn = String(toolName || "").toLowerCase();
   const url = extractUrlFromToolParams(params);
+  // The classifier's tool kind covers host vocabularies the name heuristics below
+  // miss (write_file, patch, web_extract). Exec is deliberately NOT keyed off it:
+  // that would rate every `ls` high and undo the low-risk receipt tier.
+  const kind = toolKind(tn, CLASSIFIER_TABLES);
 
   // Network tools
   if (url && /^(https?:)?\/\//i.test(url)) {
@@ -919,7 +1017,7 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
       ? { risk: "high", reason: "network destination present (allowlisted)" }
       : { risk: "high", reason: "network destination not allowlisted" };
   }
-  if (tn.includes("web_fetch") || tn.includes("browser") || tn.includes("fetch")) {
+  if (kind === "network" || tn.includes("web_fetch") || tn.includes("browser") || tn.includes("fetch")) {
     return { risk: "high", reason: "network/browsing tool" };
   }
 
@@ -933,8 +1031,8 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
     return { risk: "high", reason: "execution tool" };
   }
 
-  // File mutations (heuristic by tool name)
-  if (/(^|\b)(write|edit|patch|apply|delete|rm|mkdir|upload)(\b|$)/i.test(tn)) {
+  // File mutations (classifier kind, else heuristic by tool name)
+  if (kind === "write" || /(^|\b)(write|edit|patch|apply|delete|rm|mkdir|upload)(\b|$)/i.test(tn)) {
     return { risk: "high", reason: "file mutation tool" };
   }
 
@@ -952,7 +1050,7 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
 function decideTool({ sessionId, toolName, params, workspaceDir }) {
   const tn = String(toolName || "");
   // Fail-closed: an unidentified tool call cannot be governed → deny.
-  if (!tn.trim()) return { decision: "deny", reason: "Missing tool name" };
+  if (!tn.trim()) return { decision: "deny", reason: "Missing tool name", ruleId: "tool-missing" };
   const joined = tn + " " + (() => {
     try {
       return JSON.stringify(params || {});
@@ -963,55 +1061,60 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
 
   // D: signed-policy denylist (safety floor) + classifier dangerous-deny —
   // checked before the guard's own token/rule posture so they can only ADD denies.
-  if (SIGNED_DENYLIST.includes(tn)) return { decision: "deny", reason: "Denied by signed policy denylist" };
+  if (SIGNED_DENYLIST.includes(tn)) return { decision: "deny", reason: "Denied by signed policy denylist", ruleId: ruleIdFor("denylist", tn) };
   const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0).
-  if (cls.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${cls.reasons[0] || "dangerous"}`, floor: true };
+  if (cls.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${cls.reasons[0] || "dangerous"}`, floor: true, ruleId: ruleIdFor("floor", cls.reasons[0]) };
 
   // Token posture (applies across all tools)
   const deny = matchToken([...DENY_TOKENS, ...(SIGNED_DENYTOKENS || [])], joined);
-  if (deny) return { decision: "deny", reason: `Denied token: ${deny}` };
+  if (deny) return { decision: "deny", reason: `Denied token: ${deny}`, ruleId: ruleIdFor("token-deny", deny) };
 
   // Approve/ask token lane — signed tokens honored unconditionally; the built-in heuristic net is
   // AND-conditioned on classifier concurrence (see decideExec + the egress threat-model note).
   const signedApprove = matchToken(SIGNED_APPROVETOKENS || [], joined);
-  if (signedApprove) return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}` };
+  if (signedApprove) return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}`, ruleId: ruleIdFor("token-approve", signedApprove) };
   const builtinApprove = matchToken(APPROVE_TOKENS, joined);
-  if (builtinApprove && cls.verdictHint !== "allow") return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}` };
+  if (builtinApprove && cls.verdictHint !== "allow") return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}`, ruleId: ruleIdFor("token-approve", builtinApprove) };
 
   // Tool-specific posture
   const lower = tn.toLowerCase();
 
   // Outbound messaging: default approval gate.
   if (lower.startsWith("message") || lower.includes("message")) {
-    return { decision: "approve", reason: "Outbound messaging requires approval", approvalId: `appr_${randomUUID()}` };
+    return { decision: "approve", reason: "Outbound messaging requires approval", approvalId: `appr_${randomUUID()}`, ruleId: ruleIdFor("messaging", tn) };
   }
 
   // Network/browsing: allow allowlisted destinations, otherwise require approval.
   const url = extractUrlFromToolParams(params);
   if (url) {
     if (!isDomainAllowlisted(url)) {
-      return { decision: "approve", reason: "Network destination not allowlisted", approvalId: `appr_${randomUUID()}` };
+      return { decision: "approve", reason: "Network destination not allowlisted", approvalId: `appr_${randomUUID()}`, ruleId: ruleIdFor("network", hostOf(url)) };
     }
     return { decision: "allow", reason: "Allowlisted network destination" };
   }
 
-  // File mutation: deny/approve based on workspace boundary + denied paths.
-  if (/(^|\b)(write|edit|delete|upload)(\b|$)/i.test(lower)) {
+  // File mutation: deny/approve based on workspace boundary + denied paths. Keyed
+  // off the classifier's tool kind as well as the name: the name regex needs
+  // `write`/`edit` as a whole word, so write_file, patch, MultiEdit, NotebookEdit
+  // and apply_patch all slipped past it and were never boundary-checked.
+  if (toolKind(tn, CLASSIFIER_TABLES) === "write" || /(^|\b)(write|edit|delete|upload)(\b|$)/i.test(lower)) {
     const paths = extractPathsFromToolParams(params);
     for (const p of paths) {
       const r = resolveIntentPath(p, workspaceDir);
       if (isDeniedPath(r.abs) || isDeniedPath(r.full)) {
+        const ruleId = ruleIdFor("file-denied-path", dirOf(r.full || r.abs));
         if (FILE_MUTATION_DENIED_PATH_ACTION === "approve") {
-          return { decision: "approve", reason: "File mutation touches denied path", approvalId: `appr_${randomUUID()}` };
+          return { decision: "approve", reason: "File mutation touches denied path", approvalId: `appr_${randomUUID()}`, ruleId };
         }
-        return { decision: "deny", reason: "File mutation touches denied path" };
+        return { decision: "deny", reason: "File mutation touches denied path", ruleId };
       }
       if (r.unresolved || !isInsideWorkspace(r.full)) {
+        const ruleId = ruleIdFor("file-outside-workspace", dirOf(r.full || r.abs));
         if (EFFECTIVE_FILEMUT_ACTION === "approve") {
-          return { decision: "approve", reason: "File mutation outside workspace", approvalId: `appr_${randomUUID()}` };
+          return { decision: "approve", reason: "File mutation outside workspace", approvalId: `appr_${randomUUID()}`, ruleId };
         }
-        return { decision: "deny", reason: "File mutation outside workspace" };
+        return { decision: "deny", reason: "File mutation outside workspace", ruleId };
       }
     }
   }
@@ -1019,8 +1122,8 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   // Reads: allow by default, but reading denied paths requires approval.
   if (lower === "read" || lower.includes("read")) {
     const paths = extractPathsFromToolParams(params);
-    const anyDenied = paths.some((p) => isDeniedPath(p));
-    if (anyDenied) return { decision: "approve", reason: "Read touches denied path", approvalId: `appr_${randomUUID()}` };
+    const denied = paths.find((p) => isDeniedPath(p));
+    if (denied) return { decision: "approve", reason: "Read touches denied path", approvalId: `appr_${randomUUID()}`, ruleId: ruleIdFor("read-denied-path", dirOf(expandTilde(denied))) };
     return { decision: "allow", reason: "Allowed read" };
   }
 
@@ -1035,6 +1138,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
     risk: cls.risk,
     reason: `Escalated for approval (${cls.risk}): ${cls.reasons?.[0] || "unrecognized tool"}`,
     approvalId: `appr_${randomUUID()}`,
+    ruleId: ruleIdFor("classifier", `${cls.risk}:${cls.reasons?.[0] || "unrecognized tool"}`),
   };
 }
 
@@ -1097,11 +1201,36 @@ function postVaibotProve({ receipt, idempotencyKey }) {
  * base (e.g. https://api.vaibot.io) → POST {GOVERNANCE_BASE}/v2/receipts, the same
  * host/routing the effective-mode poll uses — never the V1 provenance host.
  */
-function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion }) {
+// How a breaker says an approval was granted, and — when the host asked its own
+// question on top (Hermes' dangerous-command prompt) — what the human answered.
+// Closed vocabularies: anything else is dropped rather than written to a receipt.
+const APPROVAL_SCOPES = new Set(["prompt", "session-grant"]);
+const APPROVAL_CHOICES = new Set(["once", "session", "always", "deny", "timeout"]);
+const HOST_APPROVAL_CHOICES = new Set(["once", "session", "always", "deny", "timeout", "smart_approve", "smart_deny"]);
+const HOST_APPROVAL_SURFACES = new Set(["cli", "gateway", "smart"]);
+
+function hostApprovalFrom(raw) {
+  if (!raw || typeof raw !== "object" || !HOST_APPROVAL_CHOICES.has(raw.choice)) return null;
+  return { choice: raw.choice, surface: HOST_APPROVAL_SURFACES.has(raw.surface) ? raw.surface : null };
+}
+
+function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion, effectiveMode, hostBypass }) {
   if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return Promise.resolve(null);
 
   const toolName = String(intent?.toolName || intent?.tool || intent?.cmd?.split(" ")[0] || "unknown");
-  const command = String(intent?.cmd || intent?.command || toolName).slice(0, 500);
+  // Tool-call intents carry `params`, not a cmd/command string, so `command` used to
+  // fall through to the bare tool name — a receipt read `command: "Write"` with no
+  // indication of WHICH file was written. That left `cwd` (the agent's process cwd)
+  // as the only location on the receipt, which for a file mutation is not where the
+  // action landed, making receipts look misattributed. Name the target explicitly,
+  // using the same extractor decideTool uses for the boundary check so the receipt
+  // reports exactly what the decision governed.
+  const targets = extractPathsFromToolParams(intent?.params).map((p) => collapseHome(String(p)));
+  const command = String(
+    intent?.cmd ||
+    intent?.command ||
+    (targets.length ? `${toolName} ${targets.join(" ")}` : toolName),
+  ).slice(0, 500);
   const cwd = collapseHome(String(intent?.workspaceDir || intent?.cwd || "/"));
 
   const guardDecision = String(decision?.decision || "deny");
@@ -1115,7 +1244,36 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // stays low. This ends the "low-risk but gated" receipts.
   const riskLevel = mergeReceiptRisk(risk?.risk, decision?.risk);
 
-  const approvalStatus = guardDecision === "approve" ? "pending" : "not_required";
+  // Receipt honesty (approval resolution): this function runs ONLY from the
+  // finalize handlers, so a gated run that reaches here has already been
+  // answered — the human either approved it in the agent's native prompt (the
+  // tool then ran, and PostToolUse finalized) or rejected it (a sweep hook
+  // finalizes with approval:"denied"). Emitting the decide-time "pending" here
+  // is what left every approved action parked in the dashboard queue forever.
+  //
+  // Observe mode is the exception: nothing was enforced, so nobody was ever
+  // asked. The server keys shadow rows off observe_mode and filters them out
+  // of the pending queue, so keep the uniform "pending" and flag the mode
+  // instead of inventing a human decision that never happened.
+  const observing = normalizeMode(effectiveMode || EFFECTIVE_MODE) === "observe";
+  const humanDenied =
+    result?.approval === "denied" || result?.outcome === "denied_by_reviewer";
+  // The policy honoured the host's approval bypass: the host granted the
+  // escalation itself, so no human decided anything. Say "bypassed", never
+  // "approved".
+  const bypassed = decision?.bypassOverride === true && !humanDenied;
+
+  let approvalStatus = "not_required";
+  if (guardDecision === "approve") {
+    approvalStatus = observing ? "pending" : humanDenied ? "denied" : bypassed ? "bypassed" : "approved";
+  }
+  // How it was granted (a prompt now, or a grant the human made earlier this
+  // session) and which answer they gave — only meaningful for a resolved gate.
+  const approvalScope = APPROVAL_SCOPES.has(result?.approvalScope) ? result.approvalScope : null;
+  const approvalChoice = APPROVAL_CHOICES.has(result?.approvalChoice) ? result.approvalChoice : null;
+  const resolvedGate = approvalStatus === "approved" || approvalStatus === "denied";
+  const hostApproval = hostApprovalFrom(result?.hostApproval);
+  const bypassActive = hostBypass?.active === true;
 
   // #17: name the SIGNED policy bundle that governed this decision (decision-time
   // accurate, from the live F-157 state). Omitted under built-in defaults — the
@@ -1128,18 +1286,42 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // yet (result == null), so it is "allowed" — previously `result?.code !== 0` was true for a
   // null result, so every allowed action's precheck receipt read "blocked". Only downgrade to
   // "blocked" when a result is present AND the action actually failed (a finalize receipt).
+  const failed = result != null && (result.ok === false || (result.code != null && result.code !== 0));
   let outcome = "blocked";
   if (guardDecision === "allow") {
-    const failed = result != null && (result.ok === false || (result.code != null && result.code !== 0));
     outcome = failed ? "blocked" : "allowed";
   } else if (guardDecision === "approve") {
-    outcome = "blocked_until_approved";
+    // Denied → terminal. Approved → the action actually ran, so report what it
+    // did. Observe → never gated, so it ran too, but the mode flag carries the
+    // "this was not enforced" caveat.
+    if (humanDenied) outcome = "denied_by_reviewer";
+    else outcome = failed ? "blocked" : "allowed";
   }
 
   const agentId = String(sessionId || "unknown-session");
-  const actionVerb = mappedDecision === "deny" ? "blocked from executing" :
-    mappedDecision === "approval_required" ? "paused pending approval for" :
-    "executed";
+  const policyReason = String(decision?.reason || risk?.reason || "Policy decision");
+  const actionVerb =
+    mappedDecision === "deny" ? "blocked from executing" :
+    mappedDecision === "approval_required"
+      ? observing
+        ? "would have paused pending approval for"
+        : humanDenied
+          ? "was denied approval to run"
+          : bypassed
+            ? "executed under an approval bypass"
+            : "executed after approval"
+      : "executed";
+
+  // The gate is resolved by the time this receipt is written, so say what
+  // happened rather than restating the reason it was gated.
+  const resultSummary =
+    mappedDecision === "approval_required" && !observing
+      ? humanDenied
+        ? `Denied in the agent session — action did not run. ${policyReason}`
+        : bypassed
+          ? `Approval bypass honoured by policy — action ran without a human decision. ${policyReason}`
+          : `Approved in the agent session — action ran. ${policyReason}`
+      : policyReason;
 
   const receiptPayload = {
     run_id: runId,
@@ -1154,13 +1336,32 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
     policy: {
       risk_level: riskLevel,
       decision: mappedDecision,
-      reason: String(decision?.reason || risk?.reason || "Policy decision"),
+      reason: policyReason,
       ...(signedPolicyVersion ? { policy_version: signedPolicyVersion } : {}),
+      ...(typeof decision?.ruleId === "string" && decision.ruleId ? { rule_id: decision.ruleId } : {}),
     },
-    approval: { status: approvalStatus },
+    approval: {
+      status: approvalStatus,
+      ...(resolvedGate && approvalScope ? { scope: approvalScope } : {}),
+      ...(resolvedGate && approvalChoice ? { choice: approvalChoice } : {}),
+    },
+    // Posture, recorded on every receipt and never folded into the decision:
+    // "what ran while approvals were bypassed?" becomes a query.
+    host_bypass_active: bypassActive,
+    // Observe enforces nothing, so nothing was overridden either.
+    bypass_override: bypassed && !observing,
+    ...(bypassActive && hostBypass?.mechanism ? { host_bypass_mechanism: hostBypass.mechanism } : {}),
+    // The host's OWN approval prompt (e.g. Hermes' dangerous-command check),
+    // which can fire on a call VAIBot allowed.
+    ...(hostApproval ? { host_approval: hostApproval } : {}),
+    // The server filters observe-mode shadow rows out of the pending queue by
+    // this flag. The guard never sent it, so every shadow decision was stored
+    // observe_mode=false and surfaced as a live approval the user had to act
+    // on — for an account in observe mode, that is the whole pending queue.
+    observe_mode: observing,
     result: {
       outcome,
-      summary: String(decision?.reason || outcome),
+      summary: resultSummary,
     },
   };
 
@@ -1525,7 +1726,7 @@ function appendAudit(event) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
-      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE });
+      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE, capabilities: GUARD_CAPABILITIES });
     }
 
     // Read-only view of the active signed policy + provenance (F-155). Like
@@ -1549,6 +1750,8 @@ const server = http.createServer(async (req, res) => {
           : null,
         denylist: SIGNED_DENYLIST,
         classifierTablesPresent: !!CLASSIFIER_TABLES,
+        // What happens to an escalation while an agent host bypasses approvals.
+        hostBypassAction: EFFECTIVE_HOST_BYPASS_ACTION,
       });
     }
 
@@ -1690,7 +1893,8 @@ const server = http.createServer(async (req, res) => {
 
       const risk = classifyRisk({ intent, cmd, args });
       const receiptTier = receiptTierForExec(cmd, args);
-      const decision = decideExec({ sessionId, cmd, args, intent });
+      const hostBypass = parseHostBypass(input.hostBypass);
+      const decision = applyHostBypass(decideExec({ sessionId, cmd, args, intent }), hostBypass);
       // Receipt honesty: fold the fine-grained classifier's risk into the coarse structural
       // risk so risk_level reflects what actually drove the gate on EVERY decision path
       // (approveToken / deny-token / catastrophic-floor), not only the allow/escalate
@@ -1764,9 +1968,11 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Store context for finalize (persisted).
-      writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version });
+      // effectiveMode is captured at DECIDE time: the mode that actually
+      // governed this action, not whatever the poll has drifted to by finalize.
+      writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version, effectiveMode: EFFECTIVE_MODE, hostBypass });
 
-      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE });
+      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION });
     }
 
     if (req.method === "POST" && req.url === "/v1/decide/tool") {
@@ -1798,6 +2004,7 @@ const server = http.createServer(async (req, res) => {
 
       const paramsHash = `sha256:${sha256(stableStringify({ toolName, params }))}`;
       const approvalId = String(input?.approval?.approvalId || "");
+      const hostBypass = parseHostBypass(input.hostBypass);
 
       let decision;
 
@@ -1830,7 +2037,9 @@ const server = http.createServer(async (req, res) => {
           }
         }
       } else {
-        decision = decideTool({ sessionId, toolName, params, workspaceDir });
+        // Applied before an approval record is minted: an escalation the policy
+        // blocks under a host bypass never becomes a redeemable approval.
+        decision = applyHostBypass(decideTool({ sessionId, toolName, params, workspaceDir }), hostBypass);
 
         // If policy requires approval, mint an approval record for chat-command resolution.
         if (decision && decision.decision === "approve") {
@@ -1928,9 +2137,11 @@ const server = http.createServer(async (req, res) => {
         precheckAudit: audit,
         ts: nowIso(),
         policyVersion: POLICY.version,
+        effectiveMode: EFFECTIVE_MODE,
+        hostBypass,
       });
 
-      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE });
+      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION });
     }
 
     if (req.method === "POST" && req.url === "/v1/finalize/tool") {
@@ -1995,6 +2206,14 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // A rejected gate is terminal: burn the local approval record so a retry
+      // of the same intent cannot redeem an approval the user just refused.
+      // Best-effort — an already-expired/used record simply has nothing to do.
+      if (result?.approval === "denied" && ctx1?.decision?.approvalId) {
+        try { resolveApproval({ approvalId: ctx1.decision.approvalId, action: "deny" }); }
+        catch { /* already resolved or expired */ }
+      }
+
       // M: a tier-2 governance receipt is earned, not automatic. Only egress/network
       // or high/dangerous calls get a signed receipt; ledger-tier calls are already
       // covered by the tier-1 Merkle ledger above. Missing tier => emit (fail-safe:
@@ -2010,6 +2229,8 @@ const server = http.createServer(async (req, res) => {
           risk: ctx1?.risk,
           result,
           policyVersion: ctx1?.policyVersion,
+          effectiveMode: ctx1?.effectiveMode,
+          hostBypass: ctx1?.hostBypass,
         }).catch((e) => console.error(`[vaibot-guard] governance receipt post failed (tool): ${e?.message || e}`));
       }
 
@@ -2102,6 +2323,8 @@ const server = http.createServer(async (req, res) => {
           risk: ctx1?.risk,
           result,
           policyVersion: ctx1?.policyVersion,
+          effectiveMode: ctx1?.effectiveMode,
+          hostBypass: ctx1?.hostBypass,
         }).catch((e) => console.error(`[vaibot-guard] governance receipt post failed (exec): ${e?.message || e}`));
       }
 
