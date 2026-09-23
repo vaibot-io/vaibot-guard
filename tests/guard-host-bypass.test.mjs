@@ -299,7 +299,8 @@ test("observe enforces nothing, so a receipt never claims an override", async ()
   await g.finalize(d.runId, { outcome: "allowed" });
   const r = await g.receipt();
   assert.equal(r.observe_mode, true);
-  assert.equal(r.approval.status, "pending");
+  // Nothing was gated, so no human was asked and none is waiting.
+  assert.equal(r.approval.status, "not_required");
   assert.equal(r.bypass_override, false);
   assert.equal(r.host_bypass_active, true, "posture is still recorded");
 });

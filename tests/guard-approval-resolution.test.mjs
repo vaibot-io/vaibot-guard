@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 // approval queue permanently, and never recorded denials at all.
 //
 // Observe mode is the carve-out: nothing is enforced, so nobody is asked. Those
-// shadow rows stay `pending` but must carry observe_mode=true, which is how the
+// shadow rows are `not_required` (nobody was asked) and carry observe_mode=true, which is how the
 // server excludes them from the pending queue.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -179,7 +179,7 @@ test("an approved-but-failed action reports blocked, not allowed", async () => {
   assert.equal(r.result.outcome, "blocked", "but the action itself did not succeed");
 });
 
-test("observe-mode shadow rows stay pending AND carry observe_mode=true", async () => {
+test("observe-mode shadow rows are never pending, and carry observe_mode=true", async () => {
   const { captured, post, gate } = await startGuard({ mode: "observe", label: "observe" });
   const decided = await gate("sess-observe");
 
@@ -189,7 +189,10 @@ test("observe-mode shadow rows stay pending AND carry observe_mode=true", async 
   assert.equal(await waitUntil(() => captured.length > 0), true);
   const r = captured[0];
   assert.equal(r.observe_mode, true, "without this flag the server cannot filter shadow rows out of the queue");
-  assert.equal(r.approval.status, "pending", "uniform shadow shape — observe_mode is what excludes it");
+  // Nothing was gated, so no human was asked and none is waiting. A "pending"
+  // here is only kept out of the queue by a downstream observe_mode filter; a
+  // status that cannot be read as outstanding is excluded by construction.
+  assert.equal(r.approval.status, "not_required", "nobody was asked, so nothing is pending");
   assert.equal(r.result.outcome, "allowed", "it actually ran; claiming blocked_until_approved was a lie");
 });
 

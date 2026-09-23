@@ -16,6 +16,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { classify, toolKind } from "./classifier.mjs";
+import { receiptOutcome, actionVerbFor } from "./lib/receipt-shape.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
@@ -1335,20 +1336,22 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   const observing = normalizeMode(effectiveMode || EFFECTIVE_MODE) === "observe";
   const humanDenied =
     result?.approval === "denied" || result?.outcome === "denied_by_reviewer";
-  // The policy honoured the host's approval bypass: the host granted the
-  // escalation itself, so no human decided anything. Say "bypassed", never
-  // "approved".
   const bypassed = decision?.bypassOverride === true && !humanDenied;
 
-  let approvalStatus = "not_required";
-  if (guardDecision === "approve") {
-    approvalStatus = observing ? "pending" : humanDenied ? "denied" : bypassed ? "bypassed" : "approved";
-  }
+  // One pure function owns the (verdict x mode x what-came-back) mapping, so
+  // "pending" is emitted only for a gate that is genuinely still outstanding.
+  const shape = receiptOutcome({
+    guardDecision,
+    effectiveMode: observing ? "observe" : "enforce",
+    result,
+    bypassOverride: decision?.bypassOverride === true,
+  });
+  const approvalStatus = shape.approvalStatus;
   // How it was granted (a prompt now, or a grant the human made earlier this
   // session) and which answer they gave — only meaningful for a resolved gate.
   const approvalScope = APPROVAL_SCOPES.has(result?.approvalScope) ? result.approvalScope : null;
   const approvalChoice = APPROVAL_CHOICES.has(result?.approvalChoice) ? result.approvalChoice : null;
-  const resolvedGate = approvalStatus === "approved" || approvalStatus === "denied";
+  const resolvedGate = shape.resolved;
   const hostApproval = hostApprovalFrom(result?.hostApproval);
   const bypassActive = hostBypass?.active === true;
 
@@ -1364,30 +1367,11 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // null result, so every allowed action's precheck receipt read "blocked". Only downgrade to
   // "blocked" when a result is present AND the action actually failed (a finalize receipt).
   const failed = result != null && (result.ok === false || (result.code != null && result.code !== 0));
-  let outcome = "blocked";
-  if (guardDecision === "allow") {
-    outcome = failed ? "blocked" : "allowed";
-  } else if (guardDecision === "approve") {
-    // Denied → terminal. Approved → the action actually ran, so report what it
-    // did. Observe → never gated, so it ran too, but the mode flag carries the
-    // "this was not enforced" caveat.
-    if (humanDenied) outcome = "denied_by_reviewer";
-    else outcome = failed ? "blocked" : "allowed";
-  }
+  let outcome = shape.outcome;
 
   const agentId = String(sessionId || "unknown-session");
   const policyReason = String(decision?.reason || risk?.reason || "Policy decision");
-  const actionVerb =
-    mappedDecision === "deny" ? "blocked from executing" :
-    mappedDecision === "approval_required"
-      ? observing
-        ? "would have paused pending approval for"
-        : humanDenied
-          ? "was denied approval to run"
-          : bypassed
-            ? "executed under an approval bypass"
-            : "executed after approval"
-      : "executed";
+  const actionVerb = actionVerbFor({ mappedDecision, approvalStatus, observeMode: shape.observeMode });
 
   // The gate is resolved by the time this receipt is written, so say what
   // happened rather than restating the reason it was gated.
@@ -1435,7 +1419,7 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
     // this flag. The guard never sent it, so every shadow decision was stored
     // observe_mode=false and surfaced as a live approval the user had to act
     // on — for an account in observe mode, that is the whole pending queue.
-    observe_mode: observing,
+    observe_mode: shape.observeMode,
     result: {
       outcome,
       summary: resultSummary,
