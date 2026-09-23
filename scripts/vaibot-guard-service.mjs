@@ -99,6 +99,30 @@ let POLICY_URL = /^(off|none|disabled)$/i.test(_policyUrlEnv)
   ? ""
   : _policyUrlEnv || `${GOVERNANCE_BASE}/v2/policy`;
 
+// Per-account policy: with an API key, GET /v2/policy answers with THIS
+// account's effective bundle — the admin-set global default plus whatever the
+// account changed for itself. Without one it answers with the default, which is
+// what a guard predating per-account policy fetches and enforces.
+//
+// The key travels ONLY to the canonical control plane (or the governance base
+// already trusted with it for receipts). A VAIBOT_POLICY_URL pinned anywhere
+// else is fetched unauthenticated, so a URL override can never divert
+// credentials — the same rule the mode poll follows. The Ed25519 signature
+// stays the trust anchor either way, which is why the unauthenticated fetch is
+// still safe.
+function sameOrigin(a, b) {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+function policyFetchHeaders() {
+  if (!VAIBOT_API_KEY || !POLICY_URL) return {};
+  const trusted = [CANONICAL_GOVERNANCE_BASE, GOVERNANCE_BASE].filter(Boolean).some((base) => sameOrigin(POLICY_URL, base));
+  return trusted ? { authorization: `Bearer ${VAIBOT_API_KEY}` } : {};
+}
+
 // Identity surfaced on /health so ensureGuard() (and any client) can confirm
 // the process on this port is really the VAIBot guard and is version-compatible
 // — not a foreign squatter. INSTANCE_ID is unique per process start.
@@ -265,11 +289,20 @@ async function refreshPolicy() {
   if (!url || !POLICY_PUBKEY) return;
   let data;
   try {
+    const headers = policyFetchHeaders();
     const res = await fetch(url, {
+      headers,
       signal: AbortSignal.timeout(Number(process.env.VAIBOT_POLICY_FETCH_TIMEOUT_MS || 3000)),
     });
     if (!res.ok) {
-      console.error(`[vaibot-guard] policy fetch ${res.status} from ${url} — keeping current policy.`);
+      // Fail-static, including on 401/403: an account whose policy is TIGHTER
+      // than the global default must not be loosened to the default just
+      // because its key was rejected. Retrying unauthenticated would do exactly
+      // that, so we keep enforcing what we have.
+      const why = headers.authorization && (res.status === 401 || res.status === 403)
+        ? " (API key rejected — not falling back to the global default)"
+        : "";
+      console.error(`[vaibot-guard] policy fetch ${res.status} from ${url}${why} — keeping current policy.`);
       return;
     }
     data = await res.json().catch(() => null);
@@ -301,7 +334,11 @@ async function refreshPolicy() {
       /* cache write is best-effort */
     }
     applyLoadedBundle({ ok: true, reason: "ok", policy: bundle.policy, bundle });
-    if (changed) console.error(`[vaibot-guard] policy applied from control plane (version ${bundle.version || "?"}).`);
+    if (changed) {
+      // scope: 'account' = this account's own policy, 'default' = the admin's.
+      const tier = data.scope === "account" ? "account" : "default";
+      console.error(`[vaibot-guard] policy applied from control plane (version ${bundle.version || "?"}, ${tier}).`);
+    }
   } else if (SIGNED_POLICY.source !== "builtin") {
     // Authoritative withdrawal/revocation: server reports no active policy.
     console.error("[vaibot-guard] control plane reports no active policy (revoked) — reverting to built-in defaults.");
@@ -380,8 +417,18 @@ async function refreshEffectiveMode() {
   // either the mode or the admin verdict.
   if (!CANONICAL_GOVERNANCE_BASE || !VAIBOT_API_KEY) return; // no control plane / no creds → keep current (fail-static)
   try {
+    // Report what this guard is actually running, so the control plane can tell
+    // an account that a policy it just set is not enforced yet — either because
+    // the guard is too old to fetch a per-account bundle, or because it has not
+    // picked the new version up. Headers, not query params: this is metadata
+    // about the client, and the URL stays the one thing it has always been.
+    const enforcingVersion = SIGNED_POLICY?.source === "bundle" ? POLICY_BUNDLE?.bundle?.version : null;
     const res = await fetch(`${CANONICAL_GOVERNANCE_BASE}/v2/accounts/me`, {
-      headers: { authorization: `Bearer ${VAIBOT_API_KEY}` },
+      headers: {
+        authorization: `Bearer ${VAIBOT_API_KEY}`,
+        "x-vaibot-guard-version": GUARD_VERSION,
+        ...(enforcingVersion ? { "x-vaibot-policy-version": enforcingVersion } : {}),
+      },
       signal: AbortSignal.timeout(Number(process.env.VAIBOT_MODE_FETCH_TIMEOUT_MS || 3000)),
     });
     if (!res.ok) return; // transient/auth blip → fail-static
