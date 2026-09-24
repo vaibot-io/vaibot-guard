@@ -403,6 +403,35 @@ let EFFECTIVE_MODE = normalizeMode(process.env.VAIBOT_MODE || "enforce");
 // source of truth. A later phase drives it from the control-plane lease (guard.json
 // valid_until) + a fast incident poll.
 let CONTAINMENT_ARMED = false;
+
+// Containment SURVIVES A RESTART. A contained machine that comes back
+// permissive because someone restarted the process defeats the point, so the
+// armed state is cached next to the policy bundle and re-applied at boot,
+// before the first decision is served. The control plane stays authoritative:
+// the stream sends current state on connect, so a release that happened while
+// this guard was down is adopted as soon as it reconnects.
+const CONTAINMENT_PATH = path.join(LOG_DIR, "containment.json");
+
+function loadContainment() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CONTAINMENT_PATH, "utf-8"));
+    return raw?.contained === true;
+  } catch {
+    return false; // absent or unreadable => not contained
+  }
+}
+
+function persistContainment(armed) {
+  try {
+    fs.mkdirSync(path.dirname(CONTAINMENT_PATH), { recursive: true });
+    const tmp = CONTAINMENT_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ contained: armed, at: nowIso() }));
+    fs.renameSync(tmp, CONTAINMENT_PATH);
+  } catch {
+    /* best-effort: the in-process flag is what gates decisions */
+  }
+}
+
 function containmentDecision() {
   return { decision: "deny", reason: "VAIBot containment engaged — all actions blocked (Tier-0).", floor: true };
 }
@@ -412,8 +441,15 @@ function adoptContainment(v, source) {
   if (typeof v !== "boolean") return false;
   if (v === CONTAINMENT_ARMED) return false;
   CONTAINMENT_ARMED = v;
+  persistContainment(v);
   console.error(`[vaibot-guard] containment ${v ? "ARMED" : "cleared"} (${source}).`);
   return true;
+}
+
+// Re-arm from the cache at boot, before anything can be decided.
+if (loadContainment()) {
+  CONTAINMENT_ARMED = true;
+  console.error("[vaibot-guard] containment ARMED (restored from cache) — awaiting control plane.");
 }
 
 // Re-stamp guard.json with the current mode (only if WE still own the lock) so
@@ -482,6 +518,74 @@ async function refreshEffectiveMode() {
   } catch {
     /* fail-static: keep the last good EFFECTIVE_MODE */
   }
+}
+
+// ---- Containment stream -----------------------------------------------------
+//
+// The /me poll is a five-minute reconciliation floor. It is NOT the latency
+// path for containment: a panic switch that takes five minutes to arrive is not
+// a panic switch. GET /v2/enforcement/stream pushes transitions instead, and
+// sends the current state on connect — so reconnecting after a drop is itself
+// the resync, and a release that happened while this guard was down is adopted
+// as soon as it comes back.
+//
+// A dropped stream NEVER lifts containment: only an explicit boolean from the
+// control plane moves the flag, so losing the connection leaves the last known
+// state in force (fail-static, same rule as the poll).
+let CONTAINMENT_STREAM_ABORT = null;
+
+async function streamContainment() {
+  if (!CANONICAL_GOVERNANCE_BASE || !VAIBOT_API_KEY) return;
+  const url = `${CANONICAL_GOVERNANCE_BASE}/v2/enforcement/stream`;
+  let backoffMs = 1000;
+
+  for (;;) {
+    const ac = new AbortController();
+    CONTAINMENT_STREAM_ABORT = ac;
+    try {
+      const res = await fetch(url, {
+        headers: { authorization: `Bearer ${VAIBOT_API_KEY}`, accept: "text/event-stream" },
+        signal: ac.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`stream ${res.status}`);
+
+      // Connected: reset the backoff so a long-lived stream that eventually
+      // drops reconnects promptly rather than at yesterday's delay.
+      backoffMs = 1000;
+      console.error("[vaibot-guard] containment stream connected.");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of res.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+          if (!dataLine) continue; // a ': ping' keepalive
+          try {
+            const payload = JSON.parse(dataLine.slice(5).trim());
+            adoptContainment(payload?.contained, payload?.snapshot ? "stream (snapshot)" : "stream");
+          } catch {
+            /* a malformed frame must not move the flag */
+          }
+        }
+      }
+    } catch (e) {
+      if (ac.signal.aborted) return; // shutting down
+      console.error(`[vaibot-guard] containment stream lost (${e?.message || e}) — retrying, containment unchanged.`);
+    }
+
+    // Reconnect with jitter so a control-plane restart doesn't stampede every
+    // guard back at the same instant.
+    const jittered = backoffMs + Math.floor(Math.random() * 500);
+    await new Promise((r) => setTimeout(r, jittered));
+    backoffMs = Math.min(backoffMs * 2, 30_000);
+  }
+}
+
+if (CANONICAL_GOVERNANCE_BASE && VAIBOT_API_KEY) {
+  streamContainment().catch((e) => console.error(`[vaibot-guard] containment stream stopped: ${e?.message || e}`));
 }
 
 // Poll the control plane for the account mode on its own timer (non-blocking at
