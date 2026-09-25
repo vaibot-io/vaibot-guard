@@ -9,6 +9,20 @@ the approval-receipt fixes, Hermes host support, the policy-governed approval
 bypass and the Tier-0 containment switch.
 
 ### Security
+- **The floor no longer matches a command's DATA as though it were the command.**
+  Patterns were tested against the raw string, which cannot tell an instruction
+  from its data, so a heredoc body being written to a file — or a pattern being
+  searched *for* — was matched as if it were running. Writing documentation
+  about the guard, and grepping for the rule that fires, were both denied. Data
+  payloads are now excluded before matching: heredoc bodies that are written
+  rather than executed, search patterns (`grep`/`rg`), and request bodies
+  (`-d`/`--data`).
+  This is **not** a weakening. The same bytes were already unmatched when written
+  through a file-write tool, which never inspected content at all — the two paths
+  now agree. Anything that will be **executed** is still matched: a heredoc fed
+  to an interpreter keeps its body, `echo … | sh` is untouched, and a stripped
+  `-d` payload leaves the URL and any pipe visible. `commandForMatching()` is
+  exported so a host can reason about it.
 - **Hermes tool names are classified.** On 2.1.1 a host whose tool vocabulary the
   classifier did not recognise — notably `terminal` — was not matched by the
   catastrophic floor, so the floor could be walked past by naming a tool
@@ -16,6 +30,16 @@ bypass and the Tier-0 containment switch.
   `toolKind` is applied on both the tool and exec paths.
 
 ### Fixed
+- **`install-local` names the code it runs by absolute path, and refuses a
+  source checkout.** `ExecStart` was `node scripts/vaibot-guard-service.mjs`
+  resolved against `WorkingDirectory`, so the unit recorded whichever directory
+  the installer ran from and then executed whatever code later sat there. On one
+  machine that produced three candidate runtimes — an OpenClaw skill copy, a
+  monorepo checkout, and the npm install — with the unit naming a directory that
+  was not the one actually serving. Installing from a git checkout is now
+  refused (`--allow-source-tree` to override): a checkout is not a runtime,
+  because switching branches changes what the service runs and the version it
+  reports follows whatever is checked out.
 - **A resolved approval no longer records as pending.** The receipt's
   `approval.status` / `result.outcome` were built from the **decide-time**
   decision, hard-coding `pending` + `blocked_until_approved` for any gated
