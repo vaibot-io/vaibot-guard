@@ -63,7 +63,7 @@ Requires guard **2.2.0+** and a control plane serving `/v2/enforcement/*`.
 vaibot contain --reason "laptop looks compromised"
 ```
 
-Or the **Containment** card on `/dashboard`. Any credential on the account can engage it — session or API key — and it is idempotent, so pulling it twice is not an error. That is deliberate: a false engage costs a stalled agent for a minute, while hesitating in a real incident costs more.
+Or the **Containment** card on `/dashboard`. Any credential on the account can engage it — session or API key — and it is idempotent, so engaging twice is not an error. Engaging is intentionally low-friction: engaging unnecessarily costs a brief pause, and hesitating in a real incident costs more.
 
 Connected guards pick it up in **about a second**. A guard that is offline picks it up the moment it reconnects.
 
@@ -73,9 +73,9 @@ Connected guards pick it up in **about a second**. A guard that is offline picks
 vaibot release
 ```
 
-Releasing re-enables every agent, so it is deliberately harder than engaging:
+Releasing re-enables every agent, so it requires more than engaging does:
 
-- a **signed-in session** — an API key is refused (`session_required`). An API key is what agent-adjacent code holds, and containment exists to constrain a misbehaving agent, so an agent able to both engage and release would make it pointless.
+- a **signed-in session** — an API key is refused (`session_required`). Release is an operator action, and is gated to operator credentials.
 - **plus a second factor** — an emailed code, or a recovery code.
 
 `vaibot release` walks the emailed step-up for you. It attempts the release first, so "nothing to release" never sends mail.
@@ -101,7 +101,7 @@ curl -sX POST https://api.vaibot.io/v2/enforcement/release \
 Two rules worth knowing:
 
 - **Keep them off the machine.** A copy on a halted machine is no use.
-- **They cannot be issued while contained** (`409`). Issuing a code is issuing a release factor, so minting one mid-incident would be a way around containment. Generate a set now, while nothing is wrong.
+- **They cannot be issued while contained** (`409`). A recovery code is a release factor, so a set has to exist before it is needed. Generate one now, while nothing is wrong.
 
 Case, spacing and dashes are forgiving, and `0/O` and `1/I/L` are interchangeable — these get read off paper on a bad day.
 
@@ -111,7 +111,7 @@ Case, spacing and dashes are forgiving, and `0/O` and `1/I/L` are interchangeabl
 - The 5-minute `/v2/accounts/me` poll remains underneath as a reconciliation floor, not the latency path.
 - **A dropped stream never releases containment.** Only an explicit value from the control plane moves the flag.
 - **It survives a restart.** The engaged state is cached beside the policy bundle and re-applied before the first decision, so a contained machine does not come back permissive.
-- The stream talks to the **canonical** governance base, never an overridable one, so a `VAIBOT_GOVERNANCE_URL` override cannot point a guard at a control plane that simply never reports a change.
+- The stream always uses the **canonical** control-plane address; a local URL override cannot redirect it.
 
 ### Observing it
 
@@ -119,9 +119,9 @@ Case, spacing and dashes are forgiving, and `0/O` and `1/I/L` are interchangeabl
 - `/v1/decide/*` responses carry `contained`
 - A containment denial writes a **governance receipt** as well as the local ledger, so an incident is not invisible in the dashboard
 
-### What it does not cover
+### Scope
 
-Containment constrains a misbehaving **agent**, not a compromised **host**. Anyone with shell on the control-plane host, or the service-role key, can clear the state directly — no application-level factor changes that. The practical mitigation is credential hygiene: an agent's environment should not hold operator credentials to the control plane that governs it.
+Containment is an **application-layer control**: it governs what agents on the account are permitted to do. It does not harden the machine they run on, and it is not a substitute for OS-level isolation. Compromise of the host, or of control-plane credentials, is outside its scope and should be defended separately — in particular, keep operator credentials out of the environments agents run in.
 
 ## Offline classification (`vaibot-guard classify`)
 
