@@ -369,11 +369,50 @@ async function cmdInstallLocal() {
     const SKILL_DIR = path.resolve(SCRIPT_DIR, "..");
     const envSrc = path.join(SKILL_DIR, "references", "systemd", "vaibot-guard.env");
 
+    // The unit must name the code it runs by ABSOLUTE path.
+    //
+    // ExecStart used to be `node scripts/vaibot-guard-service.mjs`, resolved
+    // against WorkingDirectory — so the unit recorded whichever directory
+    // install-local happened to run from, and then executed whatever code later
+    // sat there. On one machine that produced three candidate runtimes (an
+    // OpenClaw skill copy, a monorepo checkout, and the npm install) with the
+    // unit naming a directory that was not the one actually serving. An
+    // absolute entry point makes the unit name a specific file.
+    const SERVICE_ENTRY = path.join(SKILL_DIR, "scripts", "vaibot-guard-service.mjs");
+    if (!fs.existsSync(SERVICE_ENTRY)) {
+      die(`cannot find the service entry point at ${SERVICE_ENTRY}`);
+    }
+
+    // A source checkout is not a runtime. Installing from one means `git
+    // checkout` silently changes what the service will run on its next start,
+    // and the version it reports tracks whichever branch is out — which makes
+    // guard_version telemetry fiction. Refuse by default, with an explicit
+    // escape for anyone who knows they want it.
+    const inSourceTree = (() => {
+      let dir = SKILL_DIR;
+      for (let i = 0; i < 6; i++) {
+        if (fs.existsSync(path.join(dir, ".git"))) return dir;
+        const up = path.dirname(dir);
+        if (up === dir) break;
+        dir = up;
+      }
+      return null;
+    })();
+    if (inSourceTree && !process.argv.includes("--allow-source-tree")) {
+      die(
+        `refusing to install a service that runs from a source checkout (${inSourceTree}).\n` +
+          `  A checkout is not a runtime: switching branches changes what the service runs,\n` +
+          `  and the version it reports follows whatever is checked out.\n` +
+          `  Install the published package first:  npm install -g @vaibot/guard\n` +
+          `  then re-run install-local from there. To override anyway: --allow-source-tree`,
+      );
+    }
+
     // Option A: generate the systemd unit entirely in code, so we don't depend
     // on shipping any `*.service` files. The openclaw-gateway ordering deps are
     // added only on OpenClaw hosts (detected by the `openclaw` binary on PATH);
-    // the guard runs standalone for any other agent. WorkingDirectory is the
-    // actual install location, so it works for an npm install or clawhub alike.
+    // the guard runs standalone for any other agent. WorkingDirectory stays for
+    // relative policy/log paths, but no longer decides which code runs.
     const isOpenClawHost = (process.env.PATH || "")
       .split(path.delimiter)
       .some((dir) => {
@@ -386,7 +425,7 @@ async function cmdInstallLocal() {
     const unitDeps = isOpenClawHost
       ? "After=network-online.target openclaw-gateway.service\nWants=openclaw-gateway.service\nPartOf=openclaw-gateway.service\n"
       : "After=network-online.target\n";
-    const unitTemplate = `[Unit]\nDescription=VAIBot Guard policy service (user)\n${unitDeps}\n[Service]\nType=simple\nWorkingDirectory=${SKILL_DIR}\nEnvironmentFile=%h/.config/vaibot-guard/vaibot-guard.env\nExecStart=/usr/bin/env node scripts/vaibot-guard-service.mjs\nRestart=on-failure\nRestartSec=2\n\n# Hardening (user-scope, safe defaults)\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n`;
+    const unitTemplate = `[Unit]\nDescription=VAIBot Guard policy service (user)\n${unitDeps}\n[Service]\nType=simple\nWorkingDirectory=${SKILL_DIR}\nEnvironmentFile=%h/.config/vaibot-guard/vaibot-guard.env\nExecStart=/usr/bin/env node ${SERVICE_ENTRY}\nRestart=on-failure\nRestartSec=2\n\n# Hardening (user-scope, safe defaults)\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n`;
 
     const envTemplate = `# VAIBot Guard (user service) environment\n\n# Required for service auth (recommended)\n# VAIBOT_GUARD_TOKEN=\n\n# Policy file\n# VAIBOT_POLICY_PATH=references/policy.default.json\n\n# Service bind\n# VAIBOT_GUARD_HOST=127.0.0.1\n# VAIBOT_GUARD_PORT=39111\n\n# Workspace + logs\n# VAIBOT_WORKSPACE=\n# VAIBOT_GUARD_LOG_DIR=\n\n# VAIBot anchoring\n# VAIBOT_API_URL=https://provenance.vaibot.io/api\n# VAIBOT_API_KEY=\n# VAIBOT_PROVE_MODEL=vaibot-guard\n# VAIBOT_PROVE_MODE=best-effort\n\n# Checkpoint cadence\n# VAIBOT_MERKLE_CHECKPOINT_EVERY=50\n# VAIBOT_MERKLE_CHECKPOINT_EVERY_MS=600000\n`;
     const unitDstDir = path.join(os.homedir(), ".config", "systemd", "user");

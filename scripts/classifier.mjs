@@ -291,10 +291,74 @@ function matchesLiveGuardPort(text, port) {
  * @param {number} [guardPort] live guard port to protect (port-as-data); the default branch covers the static default
  * @returns {{category:string, risk:string, boundary:string, reversible:boolean, reasons:string[]}}
  */
+// ── Data payloads are not commands (F4) ──────────────────────────────────────
+//
+// The floor matches patterns against the raw command string, which cannot tell
+// an instruction from its data. So a heredoc body being written to a file, or a
+// pattern being searched FOR, was matched as though it were being run: writing
+// documentation about the guard, or grepping for the rule that fires, both got
+// denied. Data is excluded from matching before the patterns run.
+//
+// This is NOT a weakening. The same bytes were already unmatched when written
+// through a file-write tool, which never inspected content at all — this makes
+// the two paths agree rather than opening anything new. Content that will
+// actually be EXECUTED is deliberately still matched, which is why a heredoc
+// feeding an interpreter keeps its body.
+const CODE_RECEIVER = /\b(?:sh|bash|zsh|dash|ksh|python3?|node|perl|ruby|php|pwsh|powershell|osascript|env)\b/i
+
+/** Drop heredoc bodies that are data. A body fed to an interpreter is kept. */
+function stripHeredocBodies(command) {
+  const lines = command.split('\n')
+  const out = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    out.push(line)
+    const m = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_-]*)\1/.exec(line)
+    if (!m) { i++; continue }
+    // Is the thing receiving this heredoc going to run it?
+    const executed = CODE_RECEIVER.test(line.slice(0, m.index))
+    const delim = m[2]
+    i++
+    const body = []
+    while (i < lines.length && lines[i].trim() !== delim) { body.push(lines[i]); i++ }
+    if (executed) out.push(...body) // e.g. `python3 - <<PY` — this is code
+    if (i < lines.length) out.push(lines[i]) // keep the terminator
+    i++
+  }
+  return out.join('\n')
+}
+
+/** A search pattern is what you are looking for, not what you are doing. */
+function stripSearchPatterns(command) {
+  return command.replace(
+    /\b(grep|egrep|fgrep|rg|ag|ack)\b((?:\s+-{1,2}[\w-]+)*)\s+('[^']*'|"[^"]*")/gi,
+    (_m, cmd, flags) => `${cmd}${flags} ''`,
+  )
+}
+
+/** A request body is data in flight. The URL and any pipe stay visible. */
+function stripRequestBodies(command) {
+  return command.replace(
+    /(\s(?:-d|--data|--data-raw|--data-binary|--data-urlencode|--json)\s+)('[^']*'|"[^"]*")/gi,
+    (_m, flag) => `${flag}''`,
+  )
+}
+
+/**
+ * What the floor should actually inspect: the command, with its data removed.
+ * Exported so the behaviour is testable and so a host can reason about it.
+ */
+export function commandForMatching(command) {
+  return stripRequestBodies(stripSearchPatterns(stripHeredocBodies(String(command ?? ''))))
+}
+
 export function classifyBash(command, tables = defaultTables(), guardPort) {
   const reasons = []
-  const full = String(command ?? '')
-  if (!full.trim()) {
+  const raw = String(command ?? '')
+  // Match against the command with its data payloads removed (see above).
+  const full = commandForMatching(raw)
+  if (!raw.trim()) {
     return { category: CATEGORY.EXEC, risk: RISK.MEDIUM, boundary: BOUNDARY.NONE, reversible: true, reasons: ['empty command'] }
   }
 

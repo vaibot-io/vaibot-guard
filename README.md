@@ -34,7 +34,7 @@ A local HTTP service that gates agent tool calls and writes a **tamper-evident a
 - `VAIBOT_API_KEY` — optional: anchor receipts to VAIBot `/prove`
 
 ## HTTP API
-- `GET  /health`
+- `GET  /health`                                             — identity, capabilities, `effective_mode`, `contained`
 - `POST /v1/decide/exec`   + `POST /v1/finalize`            — shell exec flows
 - `POST /v1/decide/tool`   + `POST /v1/finalize/tool`       — tool-call gating
 - `POST /v1/approvals/list` + `POST /v1/approvals/resolve`  — approve / deny
@@ -50,6 +50,78 @@ When `VAIBOT_GUARD_TOKEN` is set, protected endpoints require `Authorization: Be
 | `host-vocab:hermes` | Hermes tool names (`terminal`, `write_file`, `patch`, `read_file`, `search_files`, `web_extract`) are classified natively; a client may send them as-is. |
 | `host-bypass` | Decide accepts `hostBypass` and applies the policy's `hostBypassAction` itself (below). A client should report its host's bypass state rather than enforce its own default. |
 | `rule-id` | Escalations and denials carry `decision.ruleId`, the policy rule that fired and its subject. |
+
+## Containment — the account-wide halt
+
+Containment halts **every agent on the account, on every machine**. It is evaluated *before* policy and the classifier, so it holds when policy is stale, unfetchable or fails signature verification — and it holds in **observe mode**, which nothing else does.
+
+Requires guard **2.2.0+** and a control plane serving `/v2/enforcement/*`.
+
+### Engage it
+
+```bash
+vaibot contain --reason "laptop looks compromised"
+```
+
+Or the **Containment** card on `/dashboard`. Any credential on the account can engage it — session or API key — and it is idempotent, so pulling it twice is not an error. That is deliberate: a false engage costs a stalled agent for a minute, while hesitating in a real incident costs more.
+
+Connected guards pick it up in **about a second**. A guard that is offline picks it up the moment it reconnects.
+
+### Release it
+
+```bash
+vaibot release
+```
+
+Releasing re-enables every agent, so it is deliberately harder than engaging:
+
+- a **signed-in session** — an API key is refused (`session_required`). An API key is what agent-adjacent code holds, and containment exists to constrain a misbehaving agent, so an agent able to both engage and release would make it pointless.
+- **plus a second factor** — an emailed code, or a recovery code.
+
+`vaibot release` walks the emailed step-up for you. It attempts the release first, so "nothing to release" never sends mail.
+
+### Recovery codes — generate these BEFORE you need them
+
+The emailed factor assumes you can reach your mail. When you cannot, every agent stays halted. Recovery codes are the way back:
+
+```bash
+curl -sX POST https://api.vaibot.io/v2/enforcement/recovery-codes \
+  -H "authorization: Bearer <session token>"
+```
+
+Eight codes, shown **once**, stored only as a hash. Redeem one in place of the emailed code:
+
+```bash
+curl -sX POST https://api.vaibot.io/v2/enforcement/release \
+  -H "authorization: Bearer <session token>" \
+  -H 'content-type: application/json' \
+  -d '{"recovery_code":"ABCD-EFGH-JKMN"}'
+```
+
+Two rules worth knowing:
+
+- **Keep them off the machine.** A copy on a halted machine is no use.
+- **They cannot be issued while contained** (`409`). Issuing a code is issuing a release factor, so minting one mid-incident would be a way around containment. Generate a set now, while nothing is wrong.
+
+Case, spacing and dashes are forgiving, and `0/O` and `1/I/L` are interchangeable — these get read off paper on a bad day.
+
+### How the guard learns about it
+
+- **Pushed** over `GET /v2/enforcement/stream` (SSE), so a change lands in about a second rather than at the next poll. Current state arrives on connect, so a reconnect resynchronises by itself.
+- The 5-minute `/v2/accounts/me` poll remains underneath as a reconciliation floor, not the latency path.
+- **A dropped stream never releases containment.** Only an explicit value from the control plane moves the flag.
+- **It survives a restart.** The engaged state is cached beside the policy bundle and re-applied before the first decision, so a contained machine does not come back permissive.
+- The stream talks to the **canonical** governance base, never an overridable one, so a `VAIBOT_GOVERNANCE_URL` override cannot point a guard at a control plane that simply never reports a change.
+
+### Observing it
+
+- `GET /health` reports `contained`
+- `/v1/decide/*` responses carry `contained`
+- A containment denial writes a **governance receipt** as well as the local ledger, so an incident is not invisible in the dashboard
+
+### What it does not cover
+
+Containment constrains a misbehaving **agent**, not a compromised **host**. Anyone with shell on the control-plane host, or the service-role key, can clear the state directly — no application-level factor changes that. The practical mitigation is credential hygiene: an agent's environment should not hold operator credentials to the control plane that governs it.
 
 ## Offline classification (`vaibot-guard classify`)
 
