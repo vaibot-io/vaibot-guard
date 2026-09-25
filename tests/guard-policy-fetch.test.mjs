@@ -41,7 +41,7 @@ function startPolicyServer(makeBody) {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
       if (req.url === "/v2/policy") {
-        const { status, json } = makeBody();
+        const { status, json } = makeBody(req);
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(json));
         return;
@@ -54,7 +54,7 @@ function startPolicyServer(makeBody) {
   });
 }
 
-async function startGuard({ logDir, policyUrl, pubkey, refreshMs }) {
+async function startGuard({ logDir, policyUrl, pubkey, refreshMs, extraEnv }) {
   const port = 47200 + Math.floor(Math.random() * 2000);
   fs.mkdirSync(logDir, { recursive: true });
   const env = {
@@ -69,6 +69,7 @@ async function startGuard({ logDir, policyUrl, pubkey, refreshMs }) {
     VAIBOT_POLICY_URL: policyUrl,
     VAIBOT_POLICY_PUBKEY: pubkey,
     ...(refreshMs ? { VAIBOT_POLICY_REFRESH_MS: String(refreshMs) } : {}),
+    ...(extraEnv ?? {}),
   };
   const server = spawn(process.execPath, [SERVICE_PATH], { env, stdio: ["ignore", "pipe", "pipe"] });
   guards.push(server);
@@ -156,6 +157,84 @@ test("F-157: guard applies policy changes + revocation at runtime (refresh)", as
   const reverted = await waitUntil(async () => (await policy()).source === "builtin");
   assert.equal(reverted, true, "guard should honor revocation within the refresh window");
   assert.deepEqual((await policy()).denylist, []);
+});
+
+// ---- Per-account policy (two tiers).
+//
+// GET /v2/policy answers with the caller's OWN effective policy when it carries
+// an API key, and with the admin-set global default when it doesn't. So the
+// guard sends its key — but only to the control plane it already trusts with
+// it, never to a host a VAIBOT_POLICY_URL override points at.
+
+test("sends the API key to its own control plane, so it gets the ACCOUNT's policy", async () => {
+  const seen = [];
+  let port;
+  const url = await startPolicyServer((req) => {
+    seen.push(req.headers.authorization ?? null);
+    // What the server does for an authenticated caller: their own bundle.
+    return { status: 200, json: { ok: true, scope: "account", bundle: signed(["AccountTool"]) } };
+  });
+  port = new URL(url).port;
+
+  const guard = await startGuard({
+    logDir: path.join(tmpRoot, "account"),
+    policyUrl: url,
+    pubkey: publicKey,
+    extraEnv: { VAIBOT_ENV: "staging", VAIBOT_API_KEY: "vbk_test_key", VAIBOT_GOVERNANCE_URL: `http://127.0.0.1:${port}` },
+  });
+
+  assert.deepEqual(seen, ["Bearer vbk_test_key"]);
+  const data = await (await fetch(`http://127.0.0.1:${guard.port}/v1/policy`)).json();
+  assert.deepEqual(data.denylist, ["AccountTool"]);
+});
+
+test("withholds the key from a policy URL pinned off the control plane", async () => {
+  const seen = [];
+  const url = await startPolicyServer((req) => {
+    seen.push(req.headers.authorization ?? null);
+    return { status: 200, json: { ok: true, bundle: signed(["ElsewhereTool"]) } };
+  });
+  // A DIFFERENT origin than the policy feed: the override must not divert the key.
+  const other = await startPolicyServer(() => ({ status: 200, json: { ok: true, active: null } }));
+
+  const guard = await startGuard({
+    logDir: path.join(tmpRoot, "foreign"),
+    policyUrl: url,
+    pubkey: publicKey,
+    extraEnv: { VAIBOT_ENV: "staging", VAIBOT_API_KEY: "vbk_test_key", VAIBOT_GOVERNANCE_URL: `http://127.0.0.1:${new URL(other).port}` },
+  });
+
+  assert.deepEqual(seen, [null], "no Authorization header should reach a foreign policy host");
+  // Still enforced: the signature, not the transport, is the trust anchor.
+  const data = await (await fetch(`http://127.0.0.1:${guard.port}/v1/policy`)).json();
+  assert.deepEqual(data.denylist, ["ElsewhereTool"]);
+});
+
+test("a rejected key keeps the account's policy — it never falls back to the default", async () => {
+  let reject = false;
+  let port;
+  const url = await startPolicyServer(() => (reject
+    ? { status: 401, json: { ok: false, error: "unauthorized" } }
+    : { status: 200, json: { ok: true, scope: "account", bundle: signed(["AccountTool"]) } }));
+  port = new URL(url).port;
+
+  const guard = await startGuard({
+    logDir: path.join(tmpRoot, "rejected"),
+    policyUrl: url,
+    pubkey: publicKey,
+    refreshMs: 500,
+    extraEnv: { VAIBOT_ENV: "staging", VAIBOT_API_KEY: "vbk_test_key", VAIBOT_GOVERNANCE_URL: `http://127.0.0.1:${port}` },
+  });
+  const policy = async () => (await (await fetch(`http://127.0.0.1:${guard.port}/v1/policy`)).json());
+  assert.deepEqual((await policy()).denylist, ["AccountTool"]);
+
+  // The key stops being accepted. An account whose own policy is TIGHTER than
+  // the global default must not be loosened to the default by a revoked key.
+  reject = true;
+  await delay(1800);
+  const after = await policy();
+  assert.equal(after.source, "bundle");
+  assert.deepEqual(after.denylist, ["AccountTool"]);
 });
 
 test.after(async () => {

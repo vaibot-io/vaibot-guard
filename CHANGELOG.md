@@ -2,6 +2,85 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
+## [2.2.0] — 2026-09-22 — per-account policy, honest approvals, Hermes hosts
+
+Everything outstanding in the guard ships as one version: per-account policy,
+the approval-receipt fixes, Hermes host support, the policy-governed approval
+bypass and the Tier-0 containment switch.
+
+### Security
+- **Hermes tool names are classified.** On 2.1.1 a host whose tool vocabulary the
+  classifier did not recognise — notably `terminal` — was not matched by the
+  catastrophic floor, so the floor could be walked past by naming a tool
+  differently. The classifier now carries the host vocabulary natively and
+  `toolKind` is applied on both the tool and exec paths.
+
+### Fixed
+- **A resolved approval no longer records as pending.** The receipt's
+  `approval.status` / `result.outcome` were built from the **decide-time**
+  decision, hard-coding `pending` + `blocked_until_approved` for any gated
+  action — but that code runs only from the finalize handlers, after the human
+  has already answered and the tool has run. Every approved action therefore
+  became a permanent card on the dashboard's approval queue.
+- **`pending` is now conditional.** It is emitted for exactly one state: an
+  approve verdict with nothing back yet, which is the only row the approval
+  queue should hold. A gate that was answered records `approved` or `denied`; a
+  policy-honoured bypass records `bypassed`; observe mode records
+  `not_required`. The mapping lives in a pure `scripts/lib/receipt-shape.mjs`
+  with unit tests that run without booting the daemon.
+- **Observe-mode rows are `not_required`, not `pending`.** The old uniform
+  shadow shape was kept out of the queue only by a downstream
+  `approval_status = 'pending' AND observe_mode = false` filter; one consumer
+  reading `approval_status` alone re-created the bug. Nothing is gated in
+  observe, so nobody was asked and nobody is waiting.
+- **`observe_mode` is sent** at all, so the control plane can key shadow rows.
+- **A declined approval is recorded at all.** Declining in the agent's own
+  prompt fires no post-tool hook, so no finalize ran and no receipt was written.
+  Both sweeps now route through the local `/v1/finalize/tool` with
+  `result.approval = "denied"` — the same path an accepted approval takes —
+  instead of a `PATCH /deny` that sent a local `appr_<uuid>` to an API keyed by
+  `content_hash` and always 404'd.
+- **Receipts name the target path** of a tool call instead of falling through to
+  the bare tool name.
+- **`undefined` serialises the way `JSON.stringify` does**, so the run context
+  stays parseable and the tamper-evident audit log stays valid JSON.
+
+### Added
+- **Tier-0 containment switch.** When armed, every decision short-circuits to a
+  floor-deny *before* policy and classifier, holds even in observe mode, and is
+  independent of whether a policy can be fetched or verified. Fail-static: only
+  an explicit boolean flips it, so a poll blip can never silently lift it.
+  ⚠️ Arms from `enforcement.contained` on the `/me` poll, which no API version
+  serves yet — it ships inert until the control plane can arm it.
+- **Policy-governed approval bypass**, with rule ids and grant provenance on
+  receipts (`approval.scope`, `approval.choice`, `host_approval`).
+  ⚠️ Reachable only once the API accepts `hostBypassAction` on a policy write
+  **and** widens the receipt `approval.status` enum to include `bypassed`; until
+  both land the guard never emits it.
+- **Offline `classify` and `bootstrap` subcommands** for non-Node breakers.
+- **`/health` advertises capabilities** (`host-vocab:hermes`, `host-bypass`,
+  `rule-id`), so a client can ask what this guard understands rather than infer
+  it from a version string.
+
+### Added — per-account policy
+- **The guard fetches its OWN account's policy.** `GET /v2/policy` now answers
+  with the caller's effective policy — the admin-set global default plus
+  whatever that account changed for itself — when the request carries an API
+  key, and with the global default when it doesn't. The guard sends its key, so
+  a per-account policy reaches the machine it governs. The key travels only to
+  the control plane the guard already trusts with it; a `VAIBOT_POLICY_URL`
+  pinned at another host is still fetched, just unauthenticated, since the
+  Ed25519 signature is the trust anchor either way.
+- **Reports what it is running.** The `/v2/accounts/me` poll carries
+  `x-vaibot-guard-version` and `x-vaibot-policy-version`, so the control plane
+  can tell an account that a policy it just set is not enforced yet. This is
+  the release the API names as its `min_guard_version`.
+
+### Changed
+- A rejected key on the policy fetch is fail-static, like every other fetch
+  failure: an account whose own policy is tighter than the global default is
+  never loosened to the default because its key was revoked.
+
 ## [2.1.1] — 2026-07-04
 
 ### Docs
