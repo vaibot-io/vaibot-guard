@@ -26,12 +26,23 @@ const guards = [];
 /** A control plane that serves /v2/accounts/me and the containment stream. */
 function startControlPlane() {
   const clients = new Set();
+  const receipts = [];
   let contained = false;
 
   const server = createServer((req, res) => {
     if (req.url.startsWith("/v2/accounts/me")) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, admin: false, enforcement: { effective_mode: "enforce", contained } }));
+      return;
+    }
+    if (req.url === "/v2/receipts" && req.method === "POST") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        try { receipts.push(JSON.parse(body)); } catch { /* ignore */ }
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
       return;
     }
     if (req.url.startsWith("/v2/enforcement/stream")) {
@@ -56,6 +67,7 @@ function startControlPlane() {
           for (const res of clients) res.write(`event: containment\ndata: ${JSON.stringify({ contained: next, snapshot: false })}\n\n`);
         },
         get clientCount() { return clients.size; },
+        get receipts() { return receipts; },
         dropAll() { for (const res of clients) { try { res.end(); } catch { /* ignore */ } } clients.clear(); },
       }),
     );
@@ -202,6 +214,27 @@ test("losing the stream never lifts containment", async () => {
   await delay(600);
 
   assert.equal((await decide(port, "drop")).decision.decision, "deny", "fail-static: a dropped stream keeps the last known state");
+});
+
+test("a contained action is RECORDED — an incident must not be invisible", async () => {
+  const cp = await startControlPlane();
+  const { port } = await startGuard({ base: cp.base, logDir: path.join(tmpRoot, "receipt"), label: "receipt" });
+  assert.equal(await waitUntil(() => cp.clientCount > 0), true);
+
+  cp.push(true);
+  assert.equal(await waitUntil(async () => (await decide(port, "receipt")).contained === true), true);
+
+  const before = cp.receipts.length;
+  await decide(port, "receipt"); // denied by containment — the tool never runs, so no finalize ever fires
+
+  const got = await waitUntil(() => cp.receipts.length > before);
+  assert.equal(got, true, "a containment deny must reach the control plane on its own");
+
+  const r = cp.receipts[cp.receipts.length - 1];
+  assert.equal(r.policy.decision, "deny");
+  assert.match(r.policy.reason, /containment/i);
+  assert.equal(r.result.outcome, "blocked");
+  assert.equal(r.approval.status, "not_required");
 });
 
 test.after(async () => {

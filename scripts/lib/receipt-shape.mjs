@@ -42,9 +42,11 @@
  *        what came back from the run. null/undefined = nothing yet, which is the
  *        one state that leaves a gate genuinely outstanding.
  * @param {boolean} [a.bypassOverride]  policy honoured the host's approval bypass
+ * @param {boolean} [a.floor]  a floor deny (Tier-0 containment, catastrophic floor):
+ *        it held regardless of mode, so the action did NOT run
  * @returns {{outcome:string, approvalStatus:string, observeMode:boolean, resolved:boolean}}
  */
-export function receiptOutcome({ guardDecision, effectiveMode, result, bypassOverride = false }) {
+export function receiptOutcome({ guardDecision, effectiveMode, result, bypassOverride = false, floor = false }) {
   const observeMode = effectiveMode === "observe";
 
   // "failed" means the action ran and the command itself errored (non-zero exit
@@ -57,6 +59,14 @@ export function receiptOutcome({ guardDecision, effectiveMode, result, bypassOve
   const answered = result != null;
   const humanDenied = result?.approval === "denied" || result?.outcome === "denied_by_reviewer";
   const bypassed = bypassOverride === true && !humanDenied;
+
+  // A FLOOR deny is the exception to everything below: Tier-0 containment and
+  // the catastrophic floor hold even in observe, which is what "floor" means.
+  // Reporting such an action as having run — which the observe branch would
+  // otherwise do — would be a receipt that contradicts what the guard did.
+  if (floor && guardDecision === "deny") {
+    return { outcome: "blocked", approvalStatus: "not_required", observeMode, resolved: false };
+  }
 
   // Observe: never gated, so the action ran and nobody was asked.
   if (observeMode) {

@@ -145,6 +145,28 @@ test("an unrecognised verdict fails closed to blocked", () => {
   assert.equal(r.approvalStatus, "not_required");
 });
 
+// ── floor denies hold regardless of mode ─────────────────────────────────────
+
+test("a floor deny is blocked in ENFORCE", () => {
+  const r = receiptOutcome({ guardDecision: "deny", effectiveMode: "enforce", result: null, floor: true });
+  assert.deepEqual(r, { outcome: "blocked", approvalStatus: "not_required", observeMode: false, resolved: false });
+});
+
+test("a floor deny is blocked in OBSERVE too — that is what floor means", () => {
+  // Without this, the observe branch would report the action as having run,
+  // which for Tier-0 containment is a receipt that contradicts the guard.
+  const r = receiptOutcome({ guardDecision: "deny", effectiveMode: "observe", result: null, floor: true });
+  assert.equal(r.outcome, "blocked");
+  assert.equal(r.observeMode, true, "still flagged as observe — the mode is a fact, the block is another");
+});
+
+test("floor does not change a non-deny verdict", () => {
+  // Only a deny can be a floor deny; an allow carrying the flag must not be
+  // rewritten into a block.
+  const r = receiptOutcome({ guardDecision: "allow", effectiveMode: "observe", result: { outcome: "allowed" }, floor: true });
+  assert.equal(r.outcome, "allowed");
+});
+
 // ── the verb follows what happened ───────────────────────────────────────────
 
 test("actionVerbFor reads from the outcome, not the verdict", () => {

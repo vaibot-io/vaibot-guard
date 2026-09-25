@@ -1396,6 +1396,33 @@ function hostApprovalFrom(raw) {
   return { choice: raw.choice, surface: HOST_APPROVAL_SURFACES.has(raw.surface) ? raw.surface : null };
 }
 
+// A containment deny is the one decide-time verdict that earns its own
+// governance receipt.
+//
+// Every other deny is covered by the tier-1 ledger plus the finalize receipt.
+// But a contained action never runs, so no post-tool hook fires, so no finalize
+// ever happens — and an incident would leave NOTHING in the control plane at
+// exactly the moment the record matters most. The local tamper-evident log
+// still has it, but that log lives on the machine you may be containing
+// precisely because you do not trust it.
+//
+// Fire-and-forget: a receipt that cannot be posted must never hold up a deny.
+function postContainmentDenyReceipt({ runId, sessionId, intent, decision, risk, effectiveMode }) {
+  if (decision?.floor !== true || !CONTAINMENT_ARMED) return;
+  postGovernanceReceipt({
+    runId,
+    sessionId,
+    intent,
+    decision,
+    risk,
+    // The action did not run, and under containment that is true in observe
+    // mode too — receiptOutcome's `floor` input carries that.
+    result: { ok: false, outcome: "blocked" },
+    policyVersion: POLICY.version,
+    effectiveMode,
+  }).catch((e) => console.error(`[vaibot-guard] containment receipt post failed: ${e?.message || e}`));
+}
+
 function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion, effectiveMode, hostBypass }) {
   if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return Promise.resolve(null);
 
@@ -1449,6 +1476,7 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
     effectiveMode: observing ? "observe" : "enforce",
     result,
     bypassOverride: decision?.bypassOverride === true,
+    floor: decision?.floor === true,
   });
   const approvalStatus = shape.approvalStatus;
   // How it was granted (a prompt now, or a grant the human made earlier this
@@ -2085,6 +2113,15 @@ const server = http.createServer(async (req, res) => {
         intent,
       });
 
+      postContainmentDenyReceipt({
+        runId,
+        sessionId,
+        intent: { cmd, args, workspaceDir: WORKSPACE },
+        decision,
+        risk,
+        effectiveMode: EFFECTIVE_MODE,
+      });
+
       // Prove the *precheck receipt* (best-effort unless VAIBOT_PROVE_MODE=required).
       let prove = null;
       let proveError = null;
@@ -2245,6 +2282,15 @@ const server = http.createServer(async (req, res) => {
         risk,
         receiptTier,
         decision,
+      });
+
+      postContainmentDenyReceipt({
+        runId,
+        sessionId,
+        intent: { toolName, params, workspaceDir },
+        decision,
+        risk,
+        effectiveMode: EFFECTIVE_MODE,
       });
 
       // Prove the *precheck receipt* (best-effort unless VAIBOT_PROVE_MODE=required).
