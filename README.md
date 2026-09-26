@@ -110,7 +110,7 @@ Case, spacing and dashes are forgiving, and `0/O` and `1/I/L` are interchangeabl
 - **Pushed** over `GET /v2/enforcement/stream` (SSE), so a change lands in about a second rather than at the next poll. Current state arrives on connect, so a reconnect resynchronises by itself.
 - The 5-minute `/v2/accounts/me` poll remains underneath as a reconciliation floor, not the latency path.
 - **A dropped stream never releases containment.** Only an explicit value from the control plane moves the flag.
-- **It survives a restart.** The engaged state is cached beside the policy bundle and re-applied before the first decision, so a contained machine does not come back permissive.
+- **It survives a restart.** The engaged state is persisted locally and re-applied before the first decision, so a contained machine does not come back permissive.
 - The stream talks to the **canonical** governance base, never an overridable one, so a `VAIBOT_GOVERNANCE_URL` override cannot point a guard at a control plane that simply never reports a change.
 
 ### Observing it
