@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPair, signBundle, POLICY_BUNDLE_SCHEMA } from "../scripts/policy-bundle.mjs";
+import { reservePort } from "./lib/free-port.mjs";
 
 // Distribution wiring: the guard pulls the active signed bundle from the control
 // plane (GET /v2/policy) at startup via VAIBOT_POLICY_URL, verifies it against
@@ -55,7 +56,7 @@ function startPolicyServer(makeBody) {
 }
 
 async function startGuard({ logDir, policyUrl, pubkey, refreshMs, extraEnv }) {
-  const port = 47200 + Math.floor(Math.random() * 2000);
+  const port = await reservePort();
   fs.mkdirSync(logDir, { recursive: true });
   const env = {
     ...process.env,

@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reservePort } from "./lib/free-port.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVICE_PATH = path.resolve(__dirname, "..", "scripts", "vaibot-guard-service.mjs");
@@ -87,7 +88,7 @@ async function startGuardWithOverride({ adminVerdict }) {
     }),
   );
 
-  const port = 50_300 + Math.floor(Math.random() * 1200);
+  const port = await reservePort();
   const token = "ovr-token";
   const guard = spawn(process.execPath, [SERVICE_PATH], {
     env: {

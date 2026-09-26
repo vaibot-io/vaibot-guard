@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reservePort } from "./lib/free-port.mjs";
 
 // Exercises Phase D's ephemeral-approval invariants through the live guard:
 //  - D-140: approvals are held in memory and NEVER written to disk,
@@ -21,7 +22,7 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vaibot-guard-ephemeral-")
 const servers = [];
 
 async function startGuard({ logDir }) {
-  const port = 43200 + Math.floor(Math.random() * 2000);
+  const port = await reservePort();
   const token = "ephemeral-approval-token";
   fs.mkdirSync(logDir, { recursive: true });
   const env = {

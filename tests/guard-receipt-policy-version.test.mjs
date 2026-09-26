@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPair, signBundle, POLICY_BUNDLE_SCHEMA } from "../scripts/policy-bundle.mjs";
+import { reservePort } from "./lib/free-port.mjs";
 
 // #17: a governance receipt the guard emits names the SIGNED policy bundle
 // version that governed the decision (so a decision is joinable to its policy,
@@ -89,7 +90,7 @@ test("#17: the guard's governance receipt carries the signed policy_version", as
     }),
   );
 
-  const port = 49200 + Math.floor(Math.random() * 1500);
+  const port = await reservePort();
   const token = "pv-token";
   const guard = spawn(process.execPath, [SERVICE_PATH], {
     env: {
