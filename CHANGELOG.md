@@ -79,20 +79,22 @@ bypass and the Tier-0 containment switch.
   second, with the `/me` poll underneath as a reconciliation floor. Engaging is
   open to any credential on the account; releasing takes a signed-in session
   plus a second factor.
-- **Containment is recorded machine-wide**, not in the workspace log dir, so it
-  can be read with no daemon, no network and no credentials — the paths on which
-  a breaker degrades are exactly the paths that must still observe it. The
-  daemon treats that record as arm-only: it is read once at startup so a
-  contained machine does not come back permissive, and only an explicit value
-  from the control plane clears the flag, so it is not a local lever an agent
-  could use to release itself. The reason given when engaging travels with it.
-  ⚠️ The guard writes this record; no breaker reads it yet. Until the per-host
-  plugins consult it, containment still depends on a call reaching the daemon.
+- **Containment is recorded machine-wide**, not in a workspace log dir, so every
+  breaker on the machine reads one record — with no daemon, no network and no
+  credentials. That is what carries containment onto the paths where a breaker
+  degrades: daemon unreachable, no key, breaker tripped, fail-open, hook
+  timeout. Those are precisely the paths that must still observe it, and all of
+  them can read a file. The daemon treats the record as arm-only: it is read
+  once at startup, so a contained machine does not come back permissive, and
+  only an explicit value from the control plane clears the flag — it is not a
+  local lever an agent could use to release itself. The reason given when
+  engaging travels with it, so a halted breaker can say more than "blocked".
 - **Policy-governed approval bypass**, with rule ids and grant provenance on
-  receipts (`approval.scope`, `approval.choice`, `host_approval`).
-  ⚠️ Reachable only once the API accepts `hostBypassAction` on a policy write
-  **and** widens the receipt `approval.status` enum to include `bypassed`; until
-  both land the guard never emits it.
+  receipts (`approval.scope`, `approval.choice`, `host_approval`). The guard
+  resolves `hostBypassAction` itself and records the posture alongside the
+  decision rather than folding it in, so a bypassed approval never reads as an
+  approved one. It emits `bypassed` as soon as the control plane accepts that
+  value on a policy write and admits it in the receipt `approval.status` enum.
 - **Offline `classify` and `bootstrap` subcommands** for non-Node breakers.
 - **`/health` advertises capabilities** (`host-vocab:hermes`, `host-bypass`,
   `rule-id`), so a client can ask what this guard understands rather than infer
