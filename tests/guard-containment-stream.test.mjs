@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reservePort } from "./lib/free-port.mjs";
 
 // Containment reaches the guard by being PUSHED. The /me poll is a five-minute
 // reconciliation floor, not the latency path — an arm that takes five minutes
@@ -94,10 +95,12 @@ function writeCreds(home, base) {
   );
 }
 
-async function startGuard({ base, logDir, label }) {
-  const port = 47600 + Math.floor(Math.random() * 1500);
+async function startGuard({ base, logDir, label, home: sharedHome }) {
+  const port = await reservePort();
   fs.mkdirSync(logDir, { recursive: true });
-  const home = fs.mkdtempSync(path.join(tmpRoot, `home-${label}-`));
+  // A shared HOME models one machine: containment now lives in
+  // ~/.vaibot/guard/containment.json, read by every breaker on the box.
+  const home = sharedHome ?? fs.mkdtempSync(path.join(tmpRoot, `home-${label}-`));
   writeCreds(home, base);
   const proc = spawn(process.execPath, [SERVICE_PATH], {
     env: {
@@ -122,7 +125,7 @@ async function startGuard({ base, logDir, label }) {
   for (let i = 0; i < 60; i++) {
     try {
       const r = await fetch(`http://127.0.0.1:${port}/health`);
-      if (r.ok) return { port, proc };
+      if (r.ok) return { port, proc, home };
     } catch { /* not up yet */ }
     await delay(100);
   }
@@ -193,9 +196,9 @@ test("containment survives a restart — a contained machine does not come back 
   first.proc.kill("SIGTERM");
   await delay(300);
 
-  // It comes back with the control plane UNREACHABLE, so only the local cache
-  // can tell it what was true.
-  const offline = await startGuard({ base: "http://127.0.0.1:1", logDir, label: "restart2" });
+  // It comes back with the control plane UNREACHABLE, so only the local marker
+  // can tell it what was true — same machine, same HOME.
+  const offline = await startGuard({ base: "http://127.0.0.1:1", logDir, label: "restart2", home: first.home });
   const d = await decide(offline.port, "restart2");
   assert.equal(d.decision.decision, "deny", "a restart must not clear containment");
   assert.equal(d.contained, true);

@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reservePort } from "./lib/free-port.mjs";
 
 // A gated action's governance receipt must report the RESOLVED gate, because
 // postGovernanceReceipt only ever runs from a finalize handler — by then the
@@ -75,7 +76,7 @@ async function startGuard({ mode, label }) {
     }),
   );
 
-  const port = 49700 + Math.floor(Math.random() * 800);
+  const port = await reservePort();
   const token = `appr-token-${label}`;
   const child = spawn(process.execPath, [SERVICE_PATH], {
     env: {

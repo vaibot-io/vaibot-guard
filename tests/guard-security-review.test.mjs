@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPair, signBundle, POLICY_BUNDLE_SCHEMA } from "../scripts/policy-bundle.mjs";
+import { reservePort } from "./lib/free-port.mjs";
 
 // Phase G — security-review gate. Adversarial tests proving the no-allowlist
 // safety properties hold against a hostile agent and a hostile (but signed) bundle:
@@ -40,7 +41,7 @@ function signedBundle(policy) {
 }
 
 async function startGuard({ logDir, bundle }) {
-  const port = 45200 + Math.floor(Math.random() * 2000);
+  const port = await reservePort();
   const token = "security-review-token";
   fs.mkdirSync(logDir, { recursive: true });
   const env = {

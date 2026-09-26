@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPair, signBundle, POLICY_BUNDLE_SCHEMA } from "../scripts/policy-bundle.mjs";
+import { reservePort } from "./lib/free-port.mjs";
 
 // Exercises D's signed-policy path end-to-end through the live guard:
 //  - a denylisted tool is denied by the signed safety floor,
@@ -35,7 +36,7 @@ function makeUnsigned(overrides = {}) {
 const servers = [];
 
 async function startGuard({ bundlePath, publicKeyPem, policyPath }) {
-  const port = 41200 + Math.floor(Math.random() * 2000);
+  const port = await reservePort();
   const token = "signed-policy-token";
   const logDir = path.join(tmpRoot, `.guard-${port}`);
   fs.mkdirSync(logDir, { recursive: true });

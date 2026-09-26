@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPair, signBundle, POLICY_BUNDLE_SCHEMA } from "../scripts/policy-bundle.mjs";
+import { reservePort } from "./lib/free-port.mjs";
 
 // hostBypassAction, rule ids, and how an approval was granted — end to end
 // through a live guard, down to the governance receipt it posts.
@@ -75,7 +76,7 @@ async function startGuard({ label, signedPolicy = null, localPolicy = {}, mode =
     HOME: home,
     VAIBOT_CREDS_DIR: path.join(home, ".vaibot"),
     VAIBOT_GUARD_HOST: "127.0.0.1",
-    VAIBOT_GUARD_PORT: String(43200 + Math.floor(Math.random() * 2000)),
+    VAIBOT_GUARD_PORT: String(await reservePort()),
     VAIBOT_GUARD_TOKEN: "bypass-token",
     VAIBOT_POLICY_PATH: policyPath,
     VAIBOT_WORKSPACE: workspace,

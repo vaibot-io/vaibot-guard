@@ -19,7 +19,7 @@ import { classify, toolKind } from "./classifier.mjs";
 import { receiptOutcome, actionVerbFor } from "./lib/receipt-shape.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
-import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
+import { writeLock, readLock, LOCK_FILE, readContainment, writeContainment } from "./lib/guard-bootstrap.mjs";
 import { loadGuardEnvFile } from "./lib/env-file.mjs";
 import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv, urlOverrideAllowed, gateUrlOverride, readGuardEndpoint } from "./lib/creds.mjs";
 
@@ -403,6 +403,8 @@ let EFFECTIVE_MODE = normalizeMode(process.env.VAIBOT_MODE || "enforce");
 // source of truth. A later phase drives it from the control-plane lease (guard.json
 // valid_until) + a fast incident poll.
 let CONTAINMENT_ARMED = false;
+// Why it was engaged, so an offline breaker can say more than "blocked".
+let CONTAINMENT_REASON = null;
 
 // Containment SURVIVES A RESTART. A contained machine that comes back
 // permissive because someone restarted the process defeats the point, so the
@@ -410,26 +412,15 @@ let CONTAINMENT_ARMED = false;
 // before the first decision is served. The control plane stays authoritative:
 // the stream sends current state on connect, so a release that happened while
 // this guard was down is adopted as soon as it reconnects.
-const CONTAINMENT_PATH = path.join(LOG_DIR, "containment.json");
-
+// Machine-wide, in the shared rendezvous dir — not a workspace log dir. Every
+// breaker on the machine reads the same file, which is what makes containment
+// hold on the paths that never reach this daemon at all.
 function loadContainment() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(CONTAINMENT_PATH, "utf-8"));
-    return raw?.contained === true;
-  } catch {
-    return false; // absent or unreadable => not contained
-  }
+  return readContainment().contained;
 }
 
-function persistContainment(armed) {
-  try {
-    fs.mkdirSync(path.dirname(CONTAINMENT_PATH), { recursive: true });
-    const tmp = CONTAINMENT_PATH + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify({ contained: armed, at: nowIso() }));
-    fs.renameSync(tmp, CONTAINMENT_PATH);
-  } catch {
-    /* best-effort: the in-process flag is what gates decisions */
-  }
+function persistContainment(armed, reason = null) {
+  writeContainment(armed, reason);
 }
 
 function containmentDecision() {
@@ -441,7 +432,7 @@ function adoptContainment(v, source) {
   if (typeof v !== "boolean") return false;
   if (v === CONTAINMENT_ARMED) return false;
   CONTAINMENT_ARMED = v;
-  persistContainment(v);
+  persistContainment(v, v ? CONTAINMENT_REASON : null);
   console.error(`[vaibot-guard] containment ${v ? "ARMED" : "cleared"} (${source}).`);
   return true;
 }
@@ -565,6 +556,7 @@ async function streamContainment() {
           if (!dataLine) continue; // a ': ping' keepalive
           try {
             const payload = JSON.parse(dataLine.slice(5).trim());
+            if (typeof payload?.reason === "string") CONTAINMENT_REASON = payload.reason;
             adoptContainment(payload?.contained, payload?.snapshot ? "stream (snapshot)" : "stream");
           } catch {
             /* a malformed frame must not move the flag */

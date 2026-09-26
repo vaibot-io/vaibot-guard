@@ -6,12 +6,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reservePort } from "./lib/free-port.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVICE_PATH = path.resolve(__dirname, "..", "scripts", "vaibot-guard-service.mjs");
 const POLICY_PATH = path.resolve(__dirname, "..", "references", "policy.default.json");
 
-const PORT = 39200 + Math.floor(Math.random() * 2000);
+const PORT = await reservePort();
 const TOKEN = "test-guard-token";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vaibot-guard-skill-"));

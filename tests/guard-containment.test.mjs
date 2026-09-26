@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reservePort } from "./lib/free-port.mjs";
 
 // Phase 0 — Tier-0 containment switch. Armed ONLY by the guard adopting
 // `enforcement.contained` from its /v2/accounts/me poll — there is deliberately NO local
@@ -38,7 +39,7 @@ process.on("exit", () => {
 });
 
 async function startGuard(extraEnv = {}) {
-  const port = 39200 + Math.floor(Math.random() * 2000);
+  const port = await reservePort();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "vaibot-guard-contain-"));
   const home = path.join(root, "home");
   const credsDir = path.join(root, "creds");
