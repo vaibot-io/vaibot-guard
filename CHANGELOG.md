@@ -2,7 +2,7 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
-## [2.2.0] — 2026-09-22 — per-account policy, honest approvals, Hermes hosts
+## [2.2.0] — 2026-09-26 — per-account policy, honest approvals, containment
 
 Everything outstanding in the guard ships as one version: per-account policy,
 the approval-receipt fixes, Hermes host support, the policy-governed approval
@@ -74,8 +74,20 @@ bypass and the Tier-0 containment switch.
   floor-deny *before* policy and classifier, holds even in observe mode, and is
   independent of whether a policy can be fetched or verified. Fail-static: only
   an explicit boolean flips it, so a poll blip can never silently lift it.
-  ⚠️ Arms from `enforcement.contained` on the `/me` poll, which no API version
-  serves yet — it ships inert until the control plane can arm it.
+  Arming is live rather than pending: the control plane serves
+  `/v2/enforcement/*` and pushes state over SSE, so a change lands in about a
+  second, with the `/me` poll underneath as a reconciliation floor. Engaging is
+  open to any credential on the account; releasing takes a signed-in session
+  plus a second factor.
+- **Containment is recorded machine-wide**, not in the workspace log dir, so it
+  can be read with no daemon, no network and no credentials — the paths on which
+  a breaker degrades are exactly the paths that must still observe it. The
+  daemon treats that record as arm-only: it is read once at startup so a
+  contained machine does not come back permissive, and only an explicit value
+  from the control plane clears the flag, so it is not a local lever an agent
+  could use to release itself. The reason given when engaging travels with it.
+  ⚠️ The guard writes this record; no breaker reads it yet. Until the per-host
+  plugins consult it, containment still depends on a call reaching the daemon.
 - **Policy-governed approval bypass**, with rule ids and grant provenance on
   receipts (`approval.scope`, `approval.choice`, `host_approval`).
   ⚠️ Reachable only once the API accepts `hostBypassAction` on a policy write
@@ -104,6 +116,31 @@ bypass and the Tier-0 containment switch.
 - A rejected key on the policy fetch is fail-static, like every other fetch
   failure: an account whose own policy is tighter than the global default is
   never loosened to the default because its key was revoked.
+
+### Tests
+- **The suite no longer fails intermittently.** Fixtures drew a port from
+  hand-assigned ranges that overlapped between files running in parallel —
+  `guard-service` and `guard-containment` both from 39200-41199,
+  `guard-signed-policy` and `guard-hermes-vocab` both from 41200-43199,
+  `guard-host-bypass` and `guard-ephemeral-approvals` both from 43200-45199,
+  plus four partial overlaps. A collision left the losing guard on `EADDRINUSE`,
+  never reaching `/health`, and the file failed with "should start" — about one
+  full run in three. Fixtures now take a port from the kernel. This is a
+  harness concern only: the product's one-guard-per-machine rule is enforced by
+  the rendezvous and by the service refusing to double-bind.
+
+### Docs
+- **README and THREAT-MODEL are written for the people who install this.** Both
+  ship in the package `files`. Between them they gave the on-disk locations of
+  the audit log, the credential store, and the service's unit and environment
+  files; published how a machine fingerprint is derived; pre-announced an
+  unreleased host integration together with its tool vocabulary; and, in the
+  threat model, set out for each way a same-user adversary could defeat
+  governance the specific file to corrupt or variable to flip, and why the
+  self-protection pattern did not match it. The limitations are still stated
+  plainly — the guard is tamper-evident rather than tamper-proof, and a
+  determined same-user adversary is out of scope for a hook-only deployment.
+  The methods are no longer shipped with it.
 
 ## [2.1.1] — 2026-07-04
 
