@@ -27,7 +27,7 @@ That provides two binaries: `vaibot-guard` (operator CLI) and `vaibot-guard-serv
 
 ## What it does
 
-A local HTTP service that gates agent tool calls and writes a **tamper-evident audit log** (incremental Merkle accumulator, JSONL) under `.vaibot-guard/`. Decisions are driven by a signed policy bundle; receipts can be anchored to the VAIBot provenance chain.
+A local HTTP service that gates agent tool calls and writes a **tamper-evident audit log** (incremental Merkle accumulator, JSONL) inside the workspace. Decisions are driven by a signed policy bundle; receipts can be anchored to the VAIBot provenance chain.
 
 ## Credentials (treat as secrets)
 - `VAIBOT_GUARD_TOKEN` — bearer token for guard endpoints (recommended)
@@ -43,11 +43,11 @@ A local HTTP service that gates agent tool calls and writes a **tamper-evident a
 
 When `VAIBOT_GUARD_TOKEN` is set, protected endpoints require `Authorization: Bearer <token>`.
 
-`/health` also returns `capabilities`, a list of what this daemon's decisions understand, so a client can adapt without comparing versions. Read it from the live daemon, never from the rendezvous lock, which can outlive the process that wrote it.
+`/health` also returns `capabilities`, a list of what this daemon's decisions understand, so a client can adapt without comparing versions. Read it from the live daemon, never from a cached copy, which can outlive the process that wrote it.
 
 | Capability | Meaning |
 |---|---|
-| `host-vocab:hermes` | Hermes tool names (`terminal`, `write_file`, `patch`, `read_file`, `search_files`, `web_extract`) are classified natively; a client may send them as-is. |
+| `host-vocab:<host>` | That host's native tool names are classified directly, so a client may send them as-is instead of remapping to a generic vocabulary. |
 | `host-bypass` | Decide accepts `hostBypass` and applies the policy's `hostBypassAction` itself (below). A client should report its host's bypass state rather than enforce its own default. |
 | `rule-id` | Escalations and denials carry `decision.ruleId`, the policy rule that fired and its subject. |
 
@@ -108,7 +108,7 @@ Case, spacing and dashes are forgiving, and `0/O` and `1/I/L` are interchangeabl
 ### How the guard learns about it
 
 - **Pushed** over `GET /v2/enforcement/stream` (SSE), so a change lands in about a second rather than at the next poll. Current state arrives on connect, so a reconnect resynchronises by itself.
-- The 5-minute `/v2/accounts/me` poll remains underneath as a reconciliation floor, not the latency path.
+- A periodic `/v2/accounts/me` poll remains underneath as a reconciliation floor, not the latency path.
 - **A dropped stream never releases containment.** Only an explicit value from the control plane moves the flag.
 - **It survives a restart.** The engaged state is persisted locally and re-applied before the first decision, so a contained machine does not come back permissive.
 - The stream talks to the **canonical** governance base, never an overridable one, so a `VAIBOT_GOVERNANCE_URL` override cannot point a guard at a control plane that simply never reports a change.
@@ -121,7 +121,7 @@ Case, spacing and dashes are forgiving, and `0/O` and `1/I/L` are interchangeabl
 
 ### What it does not cover
 
-Containment constrains a misbehaving **agent**, not a compromised **host**. Anyone with shell on the control-plane host, or the service-role key, can clear the state directly — no application-level factor changes that. The practical mitigation is credential hygiene: an agent's environment should not hold operator credentials to the control plane that governs it.
+Containment constrains a misbehaving **agent**, not a compromised **host**. It is an application-level control, so it cannot outrank whoever administers the control plane itself. The practical mitigation is credential hygiene: an agent's environment should not hold operator credentials to the control plane that governs it.
 
 ## Offline classification (`vaibot-guard classify`)
 
@@ -141,10 +141,10 @@ This exists so non-Node hosts (e.g. a Python plugin) reach the *real* floor inst
 
 ## Account bootstrap (`vaibot-guard bootstrap`)
 
-Provisions a free-tier account for a machine with no API key and saves it to `~/.vaibot/credentials.json`, the store every breaker on the machine shares. It exists so non-Node hosts don't grow a second writer for that file.
+Provisions a free-tier account for a machine with no API key and saves it to the shared credential store every breaker on the machine reads. It exists so non-Node hosts don't grow a second writer for that store.
 
 ```bash
-vaibot-guard bootstrap --agent hermes [--timeout-ms 10000]
+vaibot-guard bootstrap --agent <host> [--timeout-ms 10000]
 ```
 
 stdout is one JSON line, and **never contains the key**; the caller re-reads it from the store:
@@ -157,7 +157,7 @@ stdout is one JSON line, and **never contains the key**; the caller re-reads it 
 
 **Any non-zero exit prints nothing on stdout.** Treat it as a failure to answer and fall back to your keyless posture.
 
-The fingerprint is `sha256(user@host)`, the same one every breaker sends, so a machine keeps one identity whichever breaker provisions it first. Credential resolution applies the production URL-override gate, so an injected `VAIBOT_GOVERNANCE_URL` can't redirect provisioning without `VAIBOT_ALLOW_URL_OVERRIDE`. A key issued for a different environment than the one being provisioned is refused rather than saved.
+Every breaker derives the same machine fingerprint, so a machine keeps one identity whichever breaker provisions it first. Credential resolution applies the production URL-override gate, so an injected `VAIBOT_GOVERNANCE_URL` can't redirect provisioning without `VAIBOT_ALLOW_URL_OVERRIDE`. A key issued for a different environment than the one being provisioned is refused rather than saved.
 
 ## Per-host enforcement (circuit-breaker plugins)
 
@@ -171,14 +171,14 @@ Each plugin **ensures the guard is present, installing it only if it's missing**
 
 ### Approval bypass (`hostBypassAction`)
 
-Every agent host has a switch that turns its own approval prompts off: Hermes `--yolo`, Claude Code `--dangerously-skip-permissions`. While it's on, a plugin's request for a human decision is granted before any human sees it. The signed policy's `hostBypassAction` decides what happens instead:
+Every agent host has a switch that turns its own approval prompts off, such as Claude Code's `--dangerously-skip-permissions`. While it's on, a plugin's request for a human decision is granted before any human sees it. The signed policy's `hostBypassAction` decides what happens instead:
 
 | Value | An escalation while the host's bypass is active |
 |---|---|
 | `deny` (default) | Becomes a `deny` with `decision.bypassBlocked: true`, and no approval record is minted |
 | `approve` | Stays an `approve` with `decision.bypassOverride: true`; the host grants it, and the receipt records `approval.status: "bypassed"`, never `"approved"` |
 
-Plugins report the host's state on each decide: `"hostBypass": {"active": true, "mechanism": "hermes:yolo"}`. Only a literal `true` counts, and the mechanism is a short label for the receipt. Only escalations change: a deny, the catastrophic floor included, and an allow pass through untouched. Loosening to `approve` takes a verified signed bundle; a local policy file can only set `deny`. The resolved value is on `GET /v1/policy` and in each decide response as `host_bypass_action`.
+Plugins report the host's state on each decide: `"hostBypass": {"active": true, "mechanism": "<host>:<switch>"}`. Only a literal `true` counts, and the mechanism is a short label for the receipt. Only escalations change: a deny, the catastrophic floor included, and an allow pass through untouched. Loosening to `approve` takes a verified signed bundle; a local policy file can only set `deny`. The resolved value is on `GET /v1/policy` and in each decide response as `host_bypass_action`.
 
 ### Rule ids
 
@@ -193,32 +193,24 @@ Every governance receipt records the bypass posture and never folds it into the 
 ```bash
 export VAIBOT_GUARD_HOST=127.0.0.1
 export VAIBOT_GUARD_PORT=39111
-export VAIBOT_POLICY_PATH=references/policy.default.json
 export VAIBOT_WORKSPACE="$(pwd)"
-export VAIBOT_GUARD_LOG_DIR="$VAIBOT_WORKSPACE/.vaibot-guard"
 export VAIBOT_GUARD_TOKEN="<random-token>"
 
-vaibot-guard-service                 # or: node scripts/vaibot-guard-service.mjs
+vaibot-guard-service
 curl -s http://127.0.0.1:39111/health
 ```
 
 ## systemd user service
 
 ```bash
-vaibot-guard install-local           # or: node scripts/vaibot-guard.mjs install-local
+vaibot-guard install-local
 ```
 
-Writes `~/.config/systemd/user/vaibot-guard.service` + `~/.config/vaibot-guard/vaibot-guard.env`. The unit adds OpenClaw-gateway ordering **only on OpenClaw hosts**; otherwise it runs standalone. Templates live under `references/systemd/`.
+Installs and starts a user-level service with its own environment file. The unit adds OpenClaw-gateway ordering **only on OpenClaw hosts**; otherwise it runs standalone.
 
 ## Policy + schemas
 
 See `references/`: `policy.md`, `policy.default.json`, `receipt-schema.md`, `checkpoint-schema.md`, `inclusion-proofs.md`, `required-mode.md`.
-
-## Tests
-
-```bash
-npm test    # node --test tests/*.test.mjs
-```
 
 ## Threat model
 
