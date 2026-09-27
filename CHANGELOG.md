@@ -2,6 +2,33 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
+## [2.2.1] — 2026-09-27 — the type declarations match the module
+
+### Fixed
+- **`lib/guard-bootstrap.d.mts` declares every export the module actually has.**
+  It was missing seven: `CONTAINMENT_FILE`, `readContainment`, `writeContainment`,
+  `LAUNCH_LOCK_FILE`, `acquireFileLock`, `releaseFileLock` and
+  `defaultAcquireLock`. The launch-lock four had been undeclared since that work
+  landed; containment added three more in 2.2.0.
+
+  Runtime was never affected — a declaration file does not exist at runtime, and
+  every function was genuinely exported, which is why the four `.mjs` breakers
+  were fine. A **TypeScript** consumer importing them got
+  `TS2305: has no exported member`. The openclaw breaker is TypeScript and imports
+  `readContainment`, so 1.3.0 shipped code that does not typecheck. Its tests run
+  under vitest, which strips types rather than checking them, so nothing failed.
+
+### Tests
+- **The parity test now covers `lib/guard-bootstrap.mjs`**, which is how the
+  `@vaibot/shared` copy drifted unnoticed — first by the whole launch-lock mutex,
+  then by the containment reader. It previously guarded only `classifier.mjs` and
+  `policy-bundle.mjs`, and the two paths differ (`scripts/lib/` here,
+  `src/` there), which is presumably why it was skipped.
+- **A new test asserts every runtime export appears in the declaration file**, by
+  importing the module and checking each key. A hand-written `.d.mts` beside a
+  `.mjs` drifts by default; nothing inside this package imports it from
+  TypeScript, so nothing else would notice.
+
 ## [2.2.0] — 2026-09-26 — per-account policy, honest approvals, containment
 
 Everything outstanding in the guard ships as one version: per-account policy,
