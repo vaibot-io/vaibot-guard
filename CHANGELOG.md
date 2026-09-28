@@ -49,6 +49,49 @@ All notable changes to `@vaibot/guard` are documented here.
   rather than as a verified human. A host offering "always" gets a session-length
   lease and nothing durable.
 
+- **Batch approvals — "yes to exactly these N things".** The other half of the same
+  problem, and the opposite shape to a lease.
+
+  A lease says *stop asking about this kind of thing for a while*. That is safe when
+  the action is reversible and wrong when it is not, because one answer then licenses
+  actions nobody enumerated — which is exactly how 41 branch deletions could follow a
+  single approval. A time-boxed lease on branch deletion would have been an
+  accelerant, not a mitigation.
+
+  A batch is **content-bound** (each item is the hash of one specific call, so
+  approving `git branch -D feat/a` does not approve `feat/b`), **count-bounded** (each
+  item is consumed exactly once — no rate, no window, no pattern), and **expiring**.
+
+  Because it is content-bound, a batch is the one thing that may cover a **`floorAsk`**
+  action. That is deliberate and it is not a hole: `floorAsk` means *never silent*, and
+  a batch is not silence — it is disclosure of the entire list, up front, before
+  anything runs. It removes the repetition, not the visibility.
+
+  **Authorization is stricter than a lease's, on purpose.** A lease is minted from a
+  host's assertion because the actions it covers are reversible. A batch covers
+  irreversible ones, so neither a host assertion nor the shared guard token is enough
+  — the breakers hold that token, so anything it could authorise an agent could
+  authorise for itself. Creating a batch requires **`VAIBOT_OPERATOR_TOKEN`**, a
+  separate secret that is never placed in a breaker's environment, compared in
+  constant time. If it is unset, creation is refused with a 501: the feature fails
+  closed, and absent configuration can never weaken the guard.
+
+  Listing and revoking need only the guard token — reading what was approved is not a
+  privilege, and revocation can only ever tighten. The same arm-versus-release
+  asymmetry containment uses.
+
+  The guard computes each item's hash itself, from the same fields it will see at
+  decide time, so an operator approves **calls** rather than hashes and cannot be
+  handed a hash for something they did not read. Duplicates collapse to one use, and a
+  list longer than 200 items is refused — a list nobody can read is not disclosure.
+
+- `/v1/batches/create` (operator token), `/v1/batches/list`, `/v1/batches/revoke`;
+  `batch-approval` in the advertised capabilities.
+- `tests/guard-batch-approval.test.mjs` — eleven tests through a live daemon: that a
+  batch covers `floorAsk`, that it is content- and count-bound, that the guard token
+  cannot create one, that an unset operator token fails closed, that it never turns a
+  deny into an allow, and that a batched action is still receipted.
+
 - `/v1/leases/list` and `/v1/leases/revoke`; `approval-lease` in the guard's
   advertised capabilities so a breaker or the CLI can detect support.
 - `tests/guard-approval-lease.test.mjs` — twelve tests, one per invariant, driven

@@ -12,7 +12,7 @@
 
 import http from "node:http";
 import https from "node:https";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { classify, toolKind } from "./classifier.mjs";
@@ -149,7 +149,7 @@ const INSTANCE_ID = randomUUID();
 //                       than enforce its own default.
 //   rule-id           — escalations and denials carry `decision.ruleId`, the
 //                       policy rule (and subject) that fired.
-const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease"]);
+const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease", "batch-approval"]);
 
 const VAIBOT_LOG_RETENTION_DAYS = Math.max(1, Number(process.env.VAIBOT_LOG_RETENTION_DAYS || 14));
 
@@ -196,6 +196,217 @@ const ALLOWLISTED_DOMAINS = POLICY.allowlistedDomains;
 const DENY_PATHS = POLICY.denyPaths;
 const FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION = POLICY.fileMutationOutsideWorkspaceAction || "deny";
 const FILE_MUTATION_DENIED_PATH_ACTION = POLICY.fileMutationDeniedPathAction || "deny";
+
+// ---- Batch approvals -------------------------------------------------------
+//
+// The other half of "stop asking me so much", and the opposite shape to a lease.
+//
+// A lease says "stop asking about this KIND of thing for a while". Safe when the
+// action is reversible; wrong when it is not, because one answer then covers actions
+// nobody enumerated. That is exactly how 41 branch deletions could follow a single
+// approval.
+//
+// A batch says "yes to exactly THESE N things". It is:
+//   * CONTENT-BOUND   — each item is the hash of one specific call. Approving
+//                       `git branch -D feat/a` does not approve `feat/b`.
+//   * COUNT-BOUNDED   — each item is consumed once. There is no rate, no window, no
+//                       pattern; when the list is used up the batch is done.
+//   * EXPIRING        — a TTL, in memory, dead on restart like everything else here.
+//
+// Because it is content-bound, a batch is the ONE thing that may cover a `floorAsk`
+// action. That is the point: floorAsk means "never silent", and a batch is not
+// silence — it is disclosure of the entire list, up front, before anything runs. The
+// friction it removes is the REPETITION, not the visibility.
+//
+// AUTHORIZATION IS DELIBERATELY ASYMMETRIC, and stricter than a lease's. A lease is
+// minted from a host's assertion because the actions it covers are reversible. A
+// batch covers irreversible ones, so a host assertion is not enough and neither is
+// the shared guard token — the breakers hold that token, so anything it can authorise
+// an agent can authorise for itself. Creating a batch requires VAIBOT_OPERATOR_TOKEN,
+// a separate secret that is never placed in a breaker's environment. If it is unset,
+// batch creation is refused outright: the feature fails closed and absent
+// configuration can never weaken the guard.
+const BATCH_DEFAULT_TTL_MS = Math.max(60_000, Number(process.env.VAIBOT_BATCH_TTL_MS || 60 * 60_000));
+const BATCH_MAX_TTL_MS = 12 * 60 * 60_000;
+// A ceiling on disclosure: a list nobody can read is not disclosure.
+const BATCH_MAX_ITEMS = Math.max(1, Math.min(500, Number(process.env.VAIBOT_BATCH_MAX_ITEMS || 200)));
+
+/** The operator secret, or null when batch approvals are simply not configured. */
+function operatorToken() {
+  const t = String(process.env.VAIBOT_OPERATOR_TOKEN || "").trim();
+  return t.length >= 16 ? t : null;
+}
+
+/**
+ * Is this request carrying the OPERATOR secret (not the guard token)?
+ *
+ * Constant-time compare, and it refuses when unconfigured. Deliberately does not
+ * fall back to the guard token: that would put batch creation back within reach of
+ * anything that can make a decide call.
+ */
+function requireOperator(req, res) {
+  const expected = operatorToken();
+  if (!expected) {
+    json(res, 501, {
+      ok: false,
+      error: "Batch approvals are not configured on this guard (VAIBOT_OPERATOR_TOKEN unset).",
+    });
+    return false;
+  }
+  const raw = req.headers["x-vaibot-operator-token"];
+  const got = String(Array.isArray(raw) ? raw[0] : raw || "");
+  const a = Buffer.from(got);
+  const b = Buffer.from(expected);
+  const ok = a.length === b.length && timingSafeEqual(a, b);
+  if (!ok) {
+    json(res, 401, { ok: false, error: "Unauthorized (operator token required to approve a batch)" });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * The hash that identifies one exact call. Computed by the guard from the same
+ * fields it will see at decide time, so an operator approves calls rather than
+ * hashes — they cannot smuggle in a hash for something they did not read.
+ */
+function batchIntentHash(item) {
+  if (item?.kind === "exec") {
+    const cmd = String(item.cmd || "");
+    const args = Array.isArray(item.args) ? item.args.map(String) : [];
+    return `sha256:${sha256(stableStringify({ kind: "exec", cmd, args }))}`;
+  }
+  const toolName = String(item?.toolName || "");
+  const params = item?.params && typeof item.params === "object" ? item.params : {};
+  return `sha256:${sha256(stableStringify({ toolName, params }))}`;
+}
+
+/** A one-line human-readable label, so `batches list` shows what was approved. */
+function batchItemLabel(item) {
+  if (item?.kind === "exec") {
+    return [String(item.cmd || ""), ...(Array.isArray(item.args) ? item.args.map(String) : [])].join(" ").slice(0, 200);
+  }
+  const paths = extractPathsFromToolParams(item?.params || {});
+  return `${String(item?.toolName || "?")}${paths.length ? ` ${paths[0]}` : ""}`.slice(0, 200);
+}
+
+function batchExpired(rec) {
+  return Boolean(rec?.expiresAt) && Date.now() > Date.parse(rec.expiresAt);
+}
+
+function batchDeadReason(rec) {
+  if (rec.revokedAt) return "revoked";
+  if (batchExpired(rec)) return "expired";
+  if (rec.items.every((i) => i.consumed)) return "fully consumed";
+  if (rec.mode !== EFFECTIVE_MODE) return `mode changed (${rec.mode} -> ${EFFECTIVE_MODE})`;
+  if (rec.policyVersion !== currentPolicyVersion()) return "policy changed";
+  if (CONTAINMENT_ARMED) return "containment armed";
+  return null;
+}
+
+function pruneBatches() {
+  for (const [id, rec] of BATCHES) {
+    const dead = batchDeadReason(rec);
+    if (dead && dead !== "containment armed") BATCHES.delete(id);
+  }
+}
+
+function invalidateBatches(why) {
+  if (BATCHES.size === 0) return 0;
+  const n = BATCHES.size;
+  BATCHES.clear();
+  console.error(`[vaibot-guard] ${n} batch approval(s) invalidated: ${why}.`);
+  return n;
+}
+
+function createBatch({ sessionId, items, ttlMs, reason }) {
+  if (!Array.isArray(items) || items.length === 0) return { ok: false, error: "No items to approve" };
+  if (items.length > BATCH_MAX_ITEMS) {
+    return { ok: false, error: `Too many items (${items.length} > ${BATCH_MAX_ITEMS}) — a list nobody can read is not disclosure` };
+  }
+  const ttl = Math.min(BATCH_MAX_TTL_MS, Math.max(60_000, Number(ttlMs) || BATCH_DEFAULT_TTL_MS));
+  const seen = new Set();
+  const records = [];
+  for (const raw of items) {
+    const kind = raw?.kind === "exec" ? "exec" : "tool";
+    const hash = batchIntentHash({ ...raw, kind });
+    // Duplicates collapse: approving the same call twice should not grant two uses.
+    if (seen.has(hash)) continue;
+    seen.add(hash);
+    records.push({ intentHash: hash, kind, label: batchItemLabel({ ...raw, kind }), consumed: false, consumedAt: null });
+  }
+  const rec = {
+    schema: "vaibot-guard/batch@0.1",
+    batchId: `batch_${randomUUID()}`,
+    sessionId: sessionId ? String(sessionId) : null, // null = any session on this machine
+    reason: reason ? String(reason).slice(0, 500) : null,
+    items: records,
+    mode: EFFECTIVE_MODE,
+    policyVersion: currentPolicyVersion(),
+    createdAt: nowIso(),
+    expiresAt: new Date(Date.now() + ttl).toISOString(),
+    ttlMs: ttl,
+    revokedAt: null,
+  };
+  BATCHES.set(rec.batchId, rec);
+  console.error(`[vaibot-guard] batch ${rec.batchId} approved: ${records.length} item(s), ${Math.round(ttl / 60_000)}min.`);
+  return { ok: true, batch: rec };
+}
+
+function revokeBatch(batchId) {
+  const rec = BATCHES.get(batchId);
+  if (!rec) return { ok: false, error: "Batch not found" };
+  if (rec.revokedAt) return { ok: false, error: "Batch already revoked" };
+  rec.revokedAt = nowIso();
+  const remaining = rec.items.filter((i) => !i.consumed).length;
+  console.error(`[vaibot-guard] batch ${batchId} revoked with ${remaining} item(s) unused.`);
+  return { ok: true, batchId, revokedAt: rec.revokedAt, unused: remaining };
+}
+
+function listBatches({ sessionId } = {}) {
+  const out = [];
+  for (const rec of BATCHES.values()) {
+    if (sessionId && rec.sessionId && rec.sessionId !== sessionId) continue;
+    out.push({
+      ...rec,
+      dead: batchDeadReason(rec),
+      remaining: rec.items.filter((i) => !i.consumed).length,
+    });
+  }
+  out.sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
+  return out;
+}
+
+/**
+ * Turn an `approve` into an `allow` when an unconsumed batch item names this exact
+ * call, and consume it.
+ *
+ * Unlike a lease this DOES cover floorAsk — that is the whole reason it exists. It
+ * still never touches a deny or the catastrophic floor, and it consumes exactly one
+ * item, so the count is the bound.
+ */
+function applyBatch(decision, { sessionId, intentHash }) {
+  if (decision?.decision !== "approve") return decision;
+  if (!intentHash) return decision;
+  for (const rec of BATCHES.values()) {
+    if (batchDeadReason(rec)) continue;
+    if (rec.sessionId && rec.sessionId !== sessionId) continue;
+    const item = rec.items.find((i) => !i.consumed && i.intentHash === intentHash);
+    if (!item) continue;
+    item.consumed = true;
+    item.consumedAt = nowIso();
+    const remaining = rec.items.filter((i) => !i.consumed).length;
+    return {
+      decision: "allow",
+      reason: `Allowed by batch ${rec.batchId} (item ${rec.items.length - remaining}/${rec.items.length}; would otherwise ask: ${decision.reason})`,
+      batchId: rec.batchId,
+      approvalScope: "session-grant",
+      ...(decision.risk !== undefined ? { risk: decision.risk } : {}),
+      ...(decision.ruleId ? { ruleId: decision.ruleId } : {}),
+    };
+  }
+  return decision;
+}
 
 // ---- Signed policy bundle (D): denylist (un-overridable safety floor) +
 // optional classifier-ruleset overrides. Fail-closed: a missing / invalid /
@@ -290,6 +501,7 @@ function applyLoadedBundle(loadResult) {
 // and a `const` is not hoisted — declaring it later made the daemon die at boot
 // with 'Cannot access LEASES before initialization'.
 const LEASES = new Map(); // leaseId -> record (in-memory, never persisted)
+const BATCHES = new Map(); // batchId -> record (in-memory, never persisted)
 
 const LEASE_DEFAULT_TTL_MS = Math.max(60_000, Number(process.env.VAIBOT_LEASE_TTL_MS || 30 * 60_000));
 // A ceiling the environment cannot raise. A lease is a convenience, not a posture.
@@ -350,6 +562,7 @@ async function refreshPolicy() {
     if (changed) {
       // The rules a lease was granted under are gone.
       invalidateLeases(`policy changed to version ${bundle.version || "?"}`);
+      invalidateBatches(`policy changed to version ${bundle.version || "?"}`);
       // scope: 'account' = this account's own policy, 'default' = the admin's.
       const tier = data.scope === "account" ? "account" : "default";
       console.error(`[vaibot-guard] policy applied from control plane (version ${bundle.version || "?"}, ${tier}).`);
@@ -359,6 +572,7 @@ async function refreshPolicy() {
     console.error("[vaibot-guard] control plane reports no active policy (revoked) — reverting to built-in defaults.");
     try { fs.rmSync(POLICY_BUNDLE_PATH, { force: true }); } catch { /* best effort */ }
     invalidateLeases("policy revoked — reverting to built-in defaults");
+  invalidateBatches("policy revoked — reverting to built-in defaults");
     applyLoadedBundle({ ok: false, reason: "revoked", policy: null, bundle: null });
   }
 }
@@ -451,6 +665,7 @@ function adoptContainment(v, source) {
   // release, the operator should have to re-grant deliberately rather than find
   // stale leases waiting.
   invalidateLeases(v ? "containment armed" : "containment cleared");
+  invalidateBatches(v ? "containment armed" : "containment cleared");
   persistContainment(v, v ? CONTAINMENT_REASON : null);
   console.error(`[vaibot-guard] containment ${v ? "ARMED" : "cleared"} (${source}).`);
   return true;
@@ -525,6 +740,7 @@ async function refreshEffectiveMode() {
       EFFECTIVE_MODE = m;
       // A lease granted under one mode does not carry into another.
       invalidateLeases(`effective mode changed ${previous} -> ${m}`);
+      invalidateBatches(`effective mode changed ${previous} -> ${m}`);
       republishMode();
       console.error(`[vaibot-guard] effective mode = '${m}' (control plane).`);
     }
@@ -2341,6 +2557,55 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, approvals });
     }
 
+    // Creating a batch needs the OPERATOR token, not the guard token: a batch may
+    // cover irreversible actions, and the breakers hold the guard token, so anything
+    // it could authorise an agent could authorise for itself.
+    if (req.method === "POST" && req.url === "/v1/batches/create") {
+      if (!requireOperator(req, res)) return;
+      const raw = await readBody(req);
+      let input;
+      try { input = JSON.parse(raw || "{}"); } catch { return json(res, 400, { ok: false, error: "Invalid JSON" }); }
+      const out = createBatch({
+        sessionId: input?.sessionId,
+        items: input?.items,
+        ttlMs: input?.ttlMs,
+        reason: input?.reason,
+      });
+      if (!out.ok) return json(res, 400, out);
+      // Echo the labels back so the caller can show exactly what was approved.
+      return json(res, 200, {
+        ok: true,
+        batchId: out.batch.batchId,
+        expiresAt: out.batch.expiresAt,
+        items: out.batch.items.map((i) => ({ intentHash: i.intentHash, label: i.label })),
+      });
+    }
+
+    // Listing is readable with the guard token: seeing what was approved is not a
+    // privilege, and an agent that can read it cannot grant itself anything.
+    if (req.method === "POST" && req.url === "/v1/batches/list") {
+      if (!requireAuth(req, res)) return;
+      const raw = await readBody(req);
+      let input = {};
+      try { input = JSON.parse(raw || "{}"); } catch { /* list all */ }
+      pruneBatches();
+      return json(res, 200, { ok: true, batches: listBatches({ sessionId: input?.sessionId ? String(input.sessionId) : undefined }) });
+    }
+
+    // Revocation can only ever tighten, so the guard token is enough — the same
+    // asymmetry containment uses for arm-versus-release.
+    if (req.method === "POST" && req.url === "/v1/batches/revoke") {
+      if (!requireAuth(req, res)) return;
+      const raw = await readBody(req);
+      let input;
+      try { input = JSON.parse(raw || "{}"); } catch { return json(res, 400, { ok: false, error: "Invalid JSON" }); }
+      if (input?.all === true) return json(res, 200, { ok: true, revoked: invalidateBatches("revoked by operator") });
+      const batchId = String(input?.batchId || "");
+      if (!batchId) return json(res, 400, { ok: false, error: "Missing batchId" });
+      const out = revokeBatch(batchId);
+      return json(res, out.ok ? 200 : 400, out);
+    }
+
     if (req.method === "POST" && req.url === "/v1/leases/list") {
       if (!requireAuth(req, res)) return;
       const raw = await readBody(req);
@@ -2422,6 +2687,13 @@ const server = http.createServer(async (req, res) => {
       // A lease can only ever turn `approve` into `allow`. If classify() threw,
       // execCls is null and `!== false` yields true, so an unreadable call is treated
       // as floorAsk and is NOT leasable — an error must not become a grant.
+      // A batch is checked FIRST: it names this exact call, so it is strictly more
+      // specific than a lease, and unlike a lease it may cover a floorAsk action —
+      // that is what it is for. Neither can touch a deny.
+      decision = applyBatch(decision, {
+        sessionId,
+        intentHash: batchIntentHash({ kind: "exec", cmd, args }),
+      });
       if (!hostBypass.active) {
         decision = applyLease(decision, {
           sessionId,
@@ -2596,6 +2868,7 @@ const server = http.createServer(async (req, res) => {
 
         // Before minting an approval record: a leased call needs no approval, so it
         // must not leave a pending one behind for someone to resolve later.
+        decision = applyBatch(decision, { sessionId, intentHash: paramsHash });
         if (!hostBypass.active) {
           decision = applyLease(decision, {
             sessionId,
