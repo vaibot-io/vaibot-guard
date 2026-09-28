@@ -2,7 +2,101 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
-## [2.2.2] — 2026-09-28 — the floor reads git's flags, and finds its subcommand
+## [2.3.0] — 2026-09-28 — the floor reads git's flags; two new approval tiers
+
+### Added
+- **Approval leases — "allow for this session".** An approval prompt can now be
+  answered once for a scoped, expiring set of calls instead of once per call. It
+  suppresses the **prompt**, never the **audit**: every leased action still writes a
+  receipt, tagged with the lease it ran under and with what would otherwise have been
+  asked.
+
+  This is deliberately not the grant store `classifier.mjs` rules out in its opening
+  comment ("safe is COMPUTED on every call — never granted once and remembered"). Six
+  invariants are what make the difference, and each one has a test:
+
+  1. **Human-initiated.** The only path that mints a lease is a host reporting that a
+     person answered its prompt with `session`. Nothing an agent calls mints one, and
+     a host running with approvals bypassed (`--yolo`, `bypassPermissions`) cannot
+     mint one at all — there was no human to assert.
+  2. **Scoped.** `{host session} x {exec|tool} x {classifier category} x {command head
+     or tool name} x {optional directory prefix}`. Never a wildcard in any position.
+     The prefix is the realpath'd directory, so a `..` segment or a symlink cannot
+     widen it, and a call carrying no paths is not covered by a path-scoped lease.
+  3. **Ephemeral.** In memory only — 30 minutes by default, a hard four-hour ceiling
+     the environment cannot raise, a use count, and no survival across a restart.
+     Nothing is written to disk, so there is nothing on disk to poison.
+  4. **Floor-preserving.** Only `approve` becomes `allow`. A deny is untouched, the
+     catastrophic floor is untouched, and **`floorAsk` is never leasable** — an
+     irreversible action asks every single time no matter how many leases exist. That
+     is the whole point of `floorAsk`, and a lease that could cover it would erase it.
+  5. **Dead on a change of rules.** A policy change, a mode change, or containment
+     arming invalidates every lease immediately. Checked on every use, not only at
+     mint, so a long-running call cannot mint a lease for rules that changed while it
+     ran.
+  6. **Revocable.** `/v1/leases/revoke` takes one `leaseId`, or `all: true` to drop
+     every lease on the machine. Revocation needs no second factor: unlike granting,
+     it can only ever make the guard stricter.
+
+  **The host chooses *whether*; the guard chooses *what*.** The scope is computed by
+  the guard at decide time from the real, unredacted call and stashed with the run, so
+  a host can say "session" but can never choose how much that covers.
+
+  **Trust, stated rather than implied:** the guard cannot verify that a human pressed
+  the key — the host asserts it, and `/v1/approvals/resolve` is authenticated by the
+  same shared token the breakers use to ask questions. That is exactly why a lease is
+  scoped, expiring, floor-preserving, and recorded as `grantedBy: "host-prompt"`
+  rather than as a verified human. A host offering "always" gets a session-length
+  lease and nothing durable.
+
+- **Batch approvals — "yes to exactly these N things".** The other half of the same
+  problem, and the opposite shape to a lease.
+
+  A lease says *stop asking about this kind of thing for a while*. That is safe when
+  the action is reversible and wrong when it is not, because one answer then licenses
+  actions nobody enumerated — which is exactly how 41 branch deletions could follow a
+  single approval. A time-boxed lease on branch deletion would have been an
+  accelerant, not a mitigation.
+
+  A batch is **content-bound** (each item is the hash of one specific call, so
+  approving `git branch -D feat/a` does not approve `feat/b`), **count-bounded** (each
+  item is consumed exactly once — no rate, no window, no pattern), and **expiring**.
+
+  Because it is content-bound, a batch is the one thing that may cover a **`floorAsk`**
+  action. That is deliberate and it is not a hole: `floorAsk` means *never silent*, and
+  a batch is not silence — it is disclosure of the entire list, up front, before
+  anything runs. It removes the repetition, not the visibility.
+
+  **Authorization is stricter than a lease's, on purpose.** A lease is minted from a
+  host's assertion because the actions it covers are reversible. A batch covers
+  irreversible ones, so neither a host assertion nor the shared guard token is enough
+  — the breakers hold that token, so anything it could authorise an agent could
+  authorise for itself. Creating a batch requires **`VAIBOT_OPERATOR_TOKEN`**, a
+  separate secret that is never placed in a breaker's environment, compared in
+  constant time. If it is unset, creation is refused with a 501: the feature fails
+  closed, and absent configuration can never weaken the guard.
+
+  Listing and revoking need only the guard token — reading what was approved is not a
+  privilege, and revocation can only ever tighten. The same arm-versus-release
+  asymmetry containment uses.
+
+  The guard computes each item's hash itself, from the same fields it will see at
+  decide time, so an operator approves **calls** rather than hashes and cannot be
+  handed a hash for something they did not read. Duplicates collapse to one use, and a
+  list longer than 200 items is refused — a list nobody can read is not disclosure.
+
+- `/v1/batches/create` (operator token), `/v1/batches/list`, `/v1/batches/revoke`;
+  `batch-approval` in the advertised capabilities.
+- `tests/guard-batch-approval.test.mjs` — eleven tests through a live daemon: that a
+  batch covers `floorAsk`, that it is content- and count-bound, that the guard token
+  cannot create one, that an unset operator token fails closed, that it never turns a
+  deny into an allow, and that a batched action is still receipted.
+
+- `/v1/leases/list` and `/v1/leases/revoke`; `approval-lease` in the guard's
+  advertised capabilities so a breaker or the CLI can detect support.
+- `tests/guard-approval-lease.test.mjs` — twelve tests, one per invariant, driven
+  through a live daemon and a mock control plane so the mode-change and containment
+  cases actually flip rather than asserting inside an `if` that never fires.
 
 ### Fixed
 - **`git -C <path> …` laundered every destructive git command the floor guarded.**
