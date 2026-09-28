@@ -20,6 +20,7 @@
 // vendor a byte-identical copy under scripts/lib/classifier.mjs (guarded by a
 // parity test). The openclaw plugin imports it from @vaibot/shared directly.
 
+
 export const RISK = Object.freeze({
   SAFE: 'safe',
   LOW: 'low',
@@ -202,6 +203,183 @@ const GUARD_LIFECYCLE_ALLOW = [
 ]
 
 // Elevated-risk patterns → HIGH (ask). Recoverable-but-consequential.
+// ── git invocation parsing ──────────────────────────────────────────────────
+//
+// Two defects motivated this, both found when an agent deleted 41 branches on a
+// developer's machine and this floor classified every one as `git read: branch`.
+//
+// 1. The subcommand was taken positionally, `seg.split(/\s+/)[1]`. Git accepts
+//    global options BEFORE the subcommand, so `git -C pkg reset --hard` reported its
+//    subcommand as `-c`. That misread the verb and also stopped the elevated-risk
+//    regexes matching, because they require `git` immediately followed by it —
+//    inserting `-C <path>` downgraded reset --hard, clean -f and push --force from
+//    ask to allow. `git -C` is the ordinary way to act on another directory.
+//
+// 2. Flags were never consulted. `branch` and `tag` sit on the read list because
+//    bare `git branch` lists; `git branch -D` force-deletes. Same word, opposite
+//    consequence — the predicate was judged by what it meant to match rather than
+//    by what it admitted.
+//
+// Kept in this file rather than a module of its own: classifier.mjs is vendored
+// byte-identically into @vaibot/shared, whose src/ is flat, so a separate file
+// could not carry the same relative import path in both places.
+
+/**
+ * Git's own global options, which may appear before the subcommand.
+ * From `git --help`; the value-taking ones consume the following token.
+ */
+const GLOBAL_WITH_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'])
+const GLOBAL_BOOLEAN = new Set([
+  '-P', '--no-pager', '--paginate', '--bare', '--no-replace-objects',
+  '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs',
+  '--no-optional-locks', '--html-path', '--man-path', '--info-path',
+])
+
+/**
+ * Resolve a git invocation's real subcommand and its arguments.
+ *
+ * @param {string} segment one pipeline segment whose leading word is `git`
+ * @returns {{sub: string, args: string[]}} `sub` is '' when there is no subcommand
+ */
+export function parseGitInvocation(segment) {
+  const tokens = String(segment ?? '').split(/\s+/).filter(Boolean)
+  let i = 0
+  // Leading env assignments (FOO=bar git ...), mirroring leadingWord().
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++
+  // The `git` word itself, possibly a path like /usr/bin/git.
+  if (i < tokens.length && /(^|\/)git$/i.test(tokens[i])) i++
+  // Global options before the subcommand.
+  while (i < tokens.length) {
+    const t = tokens[i]
+    if (!t.startsWith('-')) break
+    // `--git-dir=path` / `-C=path` style: value is attached, consumes one token.
+    const eq = t.indexOf('=')
+    const name = eq === -1 ? t : t.slice(0, eq)
+    if (GLOBAL_WITH_VALUE.has(name)) {
+      i += eq === -1 ? 2 : 1 // separate value token, or attached
+      continue
+    }
+    if (GLOBAL_BOOLEAN.has(name)) {
+      i += 1
+      continue
+    }
+    // An unrecognised option before any subcommand: skip it rather than treat it
+    // as the subcommand, which is what produced `git mutating: -c`. Fail toward
+    // "I do not know the subcommand" ('' — never a read) rather than a wrong one.
+    i += 1
+  }
+  const sub = (tokens[i] ?? '').toLowerCase()
+  return { sub, args: tokens.slice(i + 1) }
+}
+
+/** Does this argument list carry any of these short/long flags? */
+function hasFlag(args, shorts, longs = []) {
+  for (const a of args) {
+    if (a === '--') break // everything after `--` is a pathspec, not a flag
+    if (a.startsWith('--')) {
+      const name = a.split('=')[0]
+      if (longs.includes(name)) return true
+    } else if (a.startsWith('-') && a.length > 1) {
+      // Clustered shorts: -Dr, -fd. Compare character by character.
+      for (const ch of a.slice(1)) if (shorts.includes(ch)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Forms that destroy work or destroy the ability to recover it.
+ *
+ * Every entry is on the SAME lane as the `git reset --hard` and `git clean -f`
+ * patterns that the floor already elevated — high risk, which asks. Not a hard
+ * deny: deleting a merged branch is ordinary hygiene, and a floor that refuses it
+ * outright is a floor people switch off. What is not acceptable is doing it
+ * silently, with a receipt that says "git read".
+ *
+ * @param {string} sub resolved subcommand
+ * @param {string[]} args tokens after the subcommand
+ * @returns {string|null} why it is destructive, or null
+ */
+export function gitDestructiveReason(sub, args) {
+  switch (sub) {
+    case 'branch':
+      if (hasFlag(args, ['d', 'D'], ['--delete'])) return 'deletes a branch (git branch -d/-D)'
+      return null
+    case 'tag':
+      if (hasFlag(args, ['d'], ['--delete'])) return 'deletes a tag (git tag -d)'
+      return null
+    case 'checkout':
+      // `git checkout -- <path>` and `git checkout .` discard uncommitted work.
+      // `-b` / `-B` create a branch and are not destructive.
+      if (hasFlag(args, ['b', 'B'], ['--orphan'])) return null
+      if (args.includes('--') || args.some((a) => a === '.' || a === './')) {
+        return 'discards uncommitted changes (git checkout -- <path>)'
+      }
+      if (hasFlag(args, ['f'], ['--force'])) return 'force checkout discards local changes (git checkout -f)'
+      return null
+    case 'restore':
+      // The modern spelling of the same thing; discards the working tree by default.
+      return 'discards uncommitted changes (git restore)'
+    case 'stash':
+      if (args[0] === 'drop' || args[0] === 'clear') return `destroys stashed work (git stash ${args[0]})`
+      return null
+    case 'reset':
+      if (hasFlag(args, [], ['--hard'])) return 'discards commits and working tree (git reset --hard)'
+      return null
+    case 'clean':
+      if (hasFlag(args, ['f', 'x', 'd'], ['--force'])) return 'deletes untracked files (git clean -f)'
+      return null
+    case 'push':
+      if (hasFlag(args, ['f'], ['--force', '--force-with-lease', '--delete', '--mirror'])) {
+        return 'rewrites or deletes remote refs (git push --force/--delete)'
+      }
+      return 'publishes to a remote (git push)'
+    // ── the recovery path itself ────────────────────────────────────────────
+    // These are what turn a recoverable ref deletion into permanent loss. A
+    // deleted branch lives in the object store until it is pruned, which is the
+    // only reason 41 deleted branches were restorable. Destroying that is at
+    // least as consequential as the deletion it follows.
+    case 'reflog':
+      if (args[0] === 'expire' || args[0] === 'delete') return `destroys the recovery log (git reflog ${args[0]})`
+      return null
+    case 'gc':
+      if (hasFlag(args, [], ['--prune', '--aggressive'])) return 'prunes unreachable objects, ending recoverability (git gc --prune)'
+      return null
+    case 'filter-branch':
+      return 'rewrites history across refs (git filter-branch)'
+    case 'update-ref':
+      if (hasFlag(args, ['d'], ['--delete'])) return 'deletes a ref directly (git update-ref -d)'
+      return null
+    default:
+      return null
+  }
+}
+
+/**
+ * Subcommands that only read, once flags have been taken into account.
+ *
+ * `branch` and `tag` appear here because bare `git branch` lists — but they reach
+ * this only after gitDestructiveReason() has declined, so `git branch -D` never
+ * does. A subcommand this does not recognise is NOT a read.
+ */
+const READ_SUBS = new Set([
+  'status', 'log', 'diff', 'show', 'branch', 'remote', 'rev-parse',
+  'describe', 'blame', 'tag', 'ls-files', 'cat-file', 'ls-remote',
+  'ls-tree', 'show-ref', 'merge-base', 'shortlog', 'count-objects', 'fsck', 'reflog',
+])
+
+/** Is this a read-only git invocation? Flags are already accounted for. */
+export function isGitRead(sub, args) {
+  if (!sub) return false
+  if (gitDestructiveReason(sub, args)) return false
+  if (!READ_SUBS.has(sub)) return false
+  // A read subcommand that writes via a flag is not a read.
+  if (sub === 'branch' && hasFlag(args, ['m', 'M', 'c', 'C'], ['--move', '--copy', '--edit-description', '--set-upstream-to', '--unset-upstream'])) return false
+  if (sub === 'tag' && (hasFlag(args, ['a', 's', 'f'], ['--annotate', '--sign', '--force']) || args.some((a) => !a.startsWith('-')))) return false
+  if (sub === 'reflog' && args[0] && args[0] !== 'show') return false
+  return true
+}
+
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
   /(^|[\n|&;]\s*)su\b/i, // bare `su` — privilege escalation, same class as sudo
@@ -400,7 +578,6 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
   const safe = new Set(tables.safeCmds)
   const net = new Set(tables.networkCmds)
   const write = new Set(tables.writeCmds)
-  const readGit = new Set(tables.readGitSub)
 
   for (const seg of splitPipeline(full)) {
     const cmd = leadingWord(seg)
@@ -412,8 +589,22 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
       reversible = false
       reasons.push(`network command: ${cmd}`)
     } else if (cmd === 'git') {
-      const sub = norm(seg.split(/\s+/).filter(Boolean)[1])
-      if (readGit.has(sub)) {
+      // The subcommand is resolved by skipping git's GLOBAL options rather than
+      // taken positionally. `git -C pkg reset --hard` used to report its subcommand
+      // as `-c`, which misread the verb AND stopped the elevated-risk regexes
+      // matching (they require `git` immediately followed by it), so inserting
+      // `-C <path>` silently downgraded reset --hard, clean -f and push --force from
+      // ask to allow. Flags are consulted too: `git branch` lists, `git branch -D`
+      // destroys, and the old read-list keyed on the word alone.
+      const { sub, args } = parseGitInvocation(seg)
+      const destructive = gitDestructiveReason(sub, args)
+      if (destructive) {
+        category = CATEGORY.WRITE
+        boundary = unionBoundary(boundary, BOUNDARY.EGRESS)
+        risk = maxRisk(risk, RISK.HIGH)
+        reversible = false
+        reasons.push(`git destructive: ${destructive}`)
+      } else if (isGitRead(sub, args)) {
         category = maxRisk(risk, RISK.SAFE) === RISK.SAFE ? CATEGORY.READ : category
         boundary = unionBoundary(boundary, BOUNDARY.INGRESS)
         reasons.push(`git read: ${sub || '(none)'}`)

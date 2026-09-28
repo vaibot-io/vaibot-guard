@@ -2,6 +2,54 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
+## [2.2.2] — 2026-09-28 — the floor reads git's flags, and finds its subcommand
+
+### Fixed
+- **`git -C <path> …` laundered every destructive git command the floor guarded.**
+  The subcommand was taken positionally (`segment.split(/\s+/)[1]`), but git accepts
+  global options *before* the subcommand — so `git -C pkg reset --hard` reported its
+  subcommand as `-c`. That misread the verb, and it also stopped the elevated-risk
+  patterns matching, because they require `git` immediately followed by it. Inserting
+  `-C <path>` silently downgraded `reset --hard`, `clean -fdx` and `push --force`
+  from **ask** to **allow**. `git -C` is the ordinary way to act on another
+  directory, not an exotic evasion. The subcommand is now resolved by skipping git's
+  documented global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `-P`, … in both
+  attached and separate-value forms).
+
+- **Deleting a branch or a tag was classified as a READ and allowed.** `branch` and
+  `tag` are on the read list because bare `git branch` lists branches — and flags
+  were never consulted, so `git branch -D` and `git tag -d` arrived as
+  `git read: branch`, risk `safe`, verdict `allow`. This was found when an agent
+  deleted 41 branches on a developer's machine, including one carrying unmerged work,
+  and the floor recorded it as a read. Classification is now on (subcommand, flags)
+  together.
+
+- **The recovery path is guarded too.** `git gc --prune`, `git reflog expire|delete`,
+  `git stash drop|clear`, `git update-ref -d` and `git filter-branch` were `low` ⇒
+  allow. A deleted ref survives in the object store until it is pruned, which is the
+  only reason those 41 branches came back; ending that is at least as consequential
+  as the deletion it follows. Also added: `git checkout -- <path>`, `git checkout .`
+  and `git restore`, all of which discard uncommitted work.
+
+  Every one of these lands on **high** ⇒ *ask*, the same lane `reset --hard` and
+  `clean -f` already used — not a hard deny. Deleting a merged branch is ordinary
+  hygiene, and a floor that refuses it outright is a floor people switch off. What
+  is not acceptable is doing it silently under a receipt that says "git read".
+
+### Added
+- `tests/classifier-git.test.mjs` — there were **no** git tests in the classifier
+  suite at all, which is how both bypasses survived. Tables over the destructive
+  forms, the same forms behind every global-option spelling, the reads that must
+  stay `safe` (a floor that prompts on `git status` gets turned off), and the
+  ordinary mutations that must not escalate. Includes the verbatim command shape
+  that caused the incident.
+- `parseGitInvocation`, `gitDestructiveReason` and `isGitRead` are exported so the
+  classification is testable directly, not only through `classifyBash`.
+
+### Note
+An unrecognised git subcommand is deliberately **not** a read. A future git verb
+this file has never heard of should arrive governed rather than pre-approved.
+
 ## [2.2.1] — 2026-09-27 — the type declarations match the module
 
 ### Fixed
