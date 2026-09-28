@@ -2,6 +2,107 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
+## [2.2.2] — 2026-09-28 — the floor reads git's flags, and finds its subcommand
+
+### Fixed
+- **`git -C <path> …` laundered every destructive git command the floor guarded.**
+  The subcommand was taken positionally (`segment.split(/\s+/)[1]`), but git accepts
+  global options *before* the subcommand — so `git -C pkg reset --hard` reported its
+  subcommand as `-c`. That misread the verb, and it also stopped the elevated-risk
+  patterns matching, because they require `git` immediately followed by it. Inserting
+  `-C <path>` silently downgraded `reset --hard`, `clean -fdx` and `push --force`
+  from **ask** to **allow**. `git -C` is the ordinary way to act on another
+  directory, not an exotic evasion. The subcommand is now resolved by skipping git's
+  documented global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `-P`, … in both
+  attached and separate-value forms).
+
+- **Deleting a branch or a tag was classified as a READ and allowed.** `branch` and
+  `tag` are on the read list because bare `git branch` lists branches — and flags
+  were never consulted, so `git branch -D` and `git tag -d` arrived as
+  `git read: branch`, risk `safe`, verdict `allow`. This was found when an agent
+  deleted 41 branches on a developer's machine, including one carrying unmerged work,
+  and the floor recorded it as a read. Classification is now on (subcommand, flags)
+  together.
+
+- **The recovery path is guarded too.** `git gc --prune`, `git reflog expire|delete`,
+  `git stash drop|clear`, `git update-ref -d` and `git filter-branch` were `low` ⇒
+  allow. A deleted ref survives in the object store until it is pruned, which is the
+  only reason those 41 branches came back; ending that is at least as consequential
+  as the deletion it follows. Also added: `git checkout -- <path>`, `git checkout .`
+  and `git restore`, all of which discard uncommitted work.
+
+  Every one of these lands on **high** ⇒ *ask*, the same lane `reset --hard` and
+  `clean -f` already used — not a hard deny. Deleting a merged branch is ordinary
+  hygiene, and a floor that refuses it outright is a floor people switch off. What
+  is not acceptable is doing it silently under a receipt that says "git read".
+
+### Added
+- **`floorAsk` — a third verdict tier: never silent.** The guard had two. `DANGEROUS`
+  denies and no preset can override it; everything else is compared against the
+  preset's `escalateAt`. The **permissive** preset sets that to `dangerous`, so a
+  HIGH-risk action resolved to **allow** there — which is how branch deletion ran
+  without a prompt, and how `npm publish`, `fly deploy` and a recursive `rm` ran
+  silently on the default production preset. There was a notion of "never allowed"
+  and none of "never silent".
+
+  `floorAsk` always **asks**, whatever `escalateAt` says, and no preset can lower it.
+  It is deliberately **not** a deny: deleting a merged branch and publishing a
+  release are legitimate. It only means they cannot happen unseen. The bar for entry
+  is narrow, because a floor that interrupts routine work is a floor people stop
+  running — *the action cannot be undone by whoever authorised it, and it either
+  leaves this machine or destroys the only copy*:
+
+  - **registry publishes** — `npm/pnpm/yarn publish`, `cargo publish`,
+    `twine upload`, `uv`/`poetry`/`flit publish`, `npm unpublish`, `cargo yank`
+  - **production deploys** — `fly deploy` (its target comes from `fly.toml`, not the
+    command, so it always asks), `vercel`/`netlify --prod`
+  - **destruction with no reflog behind it** — `shred`, recursive `rm`,
+    `find … -delete`, `find … -exec rm`, `truncate -s 0`
+  - **hosted artefacts** — `gh`/`glab repo delete`, `gh release delete`
+  - **a secret's only copy** — `fly secrets unset|remove`, `vercel env rm`,
+    `gh secret delete` (`set`/`add` are additive and stay with the presets)
+  - **`supabase db reset`**
+  - **the git forms above**, except an ordinary `git push`, which adds commits rather
+    than destroying them and stays with the presets
+
+  Left to the presets on purpose: `gh pr merge`, `fly secrets set`, `psql`,
+  `supabase db push`, `git submodule update`, ordinary `git push`. Each is either
+  reversible, or its consequence is invisible in the command text, or it is frequent
+  enough that prompting would train people to work around the floor.
+
+- **Six commands were allowed on _every_ preset, including the default.** Found by
+  auditing this machine's real workflow. `cargo publish` was the worst — crates.io is
+  permanent and a yank does not remove the crate, and it was rated `low`.
+  `find … -delete` was rated **`safe`**. Also `twine upload` via `python -m`,
+  `npm unpublish`, `cargo yank` and `git submodule deinit -f`.
+
+- `tests/classifier-floor-ask.test.mjs` — the tier asks on all four presets; it never
+  becomes a deny; `DANGEROUS` still outranks it; every entry is receipted; and a
+  second table asserts the **exclusions still allow on permissive**, which is what
+  stops the tier growing into "ask about everything".
+
+### Changed
+- `classifierTables.readGitSub` is a live lever again. It is unioned into the
+  structural read set, so a signed policy can still name a subcommand this file has
+  not heard of as a read — but never a destructive form, because
+  `gitDestructiveReason()` is consulted first. Narrowing it no longer removes
+  anything, since destructiveness is decided structurally rather than by absence
+  from a list. Both directions are tightenings.
+
+### Added
+- `tests/classifier-git.test.mjs` — there were **no** git tests in the classifier
+  suite at all, which is how both bypasses survived. Tables over the destructive
+  forms, the same forms behind every global-option spelling, the reads that must
+  stay `safe` (a floor that prompts on `git status` gets turned off), and the
+  ordinary mutations that must not escalate. Includes the verbatim command shape
+  that caused the incident.
+- `parseGitInvocation`, `gitDestructiveReason` and `isGitRead` are exported so the
+  classification is testable directly, not only through `classifyBash`.
+
+### Note
+An unrecognised git subcommand is deliberately **not** a read. A future git verb
+this file has never heard of should arrive governed rather than pre-approved.
+
 ## [2.2.1] — 2026-09-27 — the type declarations match the module
 
 ### Fixed
