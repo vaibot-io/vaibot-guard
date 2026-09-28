@@ -37,6 +37,59 @@ All notable changes to `@vaibot/guard` are documented here.
   is not acceptable is doing it silently under a receipt that says "git read".
 
 ### Added
+- **`floorAsk` — a third verdict tier: never silent.** The guard had two. `DANGEROUS`
+  denies and no preset can override it; everything else is compared against the
+  preset's `escalateAt`. The **permissive** preset sets that to `dangerous`, so a
+  HIGH-risk action resolved to **allow** there — which is how branch deletion ran
+  without a prompt, and how `npm publish`, `fly deploy` and a recursive `rm` ran
+  silently on the default production preset. There was a notion of "never allowed"
+  and none of "never silent".
+
+  `floorAsk` always **asks**, whatever `escalateAt` says, and no preset can lower it.
+  It is deliberately **not** a deny: deleting a merged branch and publishing a
+  release are legitimate. It only means they cannot happen unseen. The bar for entry
+  is narrow, because a floor that interrupts routine work is a floor people stop
+  running — *the action cannot be undone by whoever authorised it, and it either
+  leaves this machine or destroys the only copy*:
+
+  - **registry publishes** — `npm/pnpm/yarn publish`, `cargo publish`,
+    `twine upload`, `uv`/`poetry`/`flit publish`, `npm unpublish`, `cargo yank`
+  - **production deploys** — `fly deploy` (its target comes from `fly.toml`, not the
+    command, so it always asks), `vercel`/`netlify --prod`
+  - **destruction with no reflog behind it** — `shred`, recursive `rm`,
+    `find … -delete`, `find … -exec rm`, `truncate -s 0`
+  - **hosted artefacts** — `gh`/`glab repo delete`, `gh release delete`
+  - **a secret's only copy** — `fly secrets unset|remove`, `vercel env rm`,
+    `gh secret delete` (`set`/`add` are additive and stay with the presets)
+  - **`supabase db reset`**
+  - **the git forms above**, except an ordinary `git push`, which adds commits rather
+    than destroying them and stays with the presets
+
+  Left to the presets on purpose: `gh pr merge`, `fly secrets set`, `psql`,
+  `supabase db push`, `git submodule update`, ordinary `git push`. Each is either
+  reversible, or its consequence is invisible in the command text, or it is frequent
+  enough that prompting would train people to work around the floor.
+
+- **Six commands were allowed on _every_ preset, including the default.** Found by
+  auditing this machine's real workflow. `cargo publish` was the worst — crates.io is
+  permanent and a yank does not remove the crate, and it was rated `low`.
+  `find … -delete` was rated **`safe`**. Also `twine upload` via `python -m`,
+  `npm unpublish`, `cargo yank` and `git submodule deinit -f`.
+
+- `tests/classifier-floor-ask.test.mjs` — the tier asks on all four presets; it never
+  becomes a deny; `DANGEROUS` still outranks it; every entry is receipted; and a
+  second table asserts the **exclusions still allow on permissive**, which is what
+  stops the tier growing into "ask about everything".
+
+### Changed
+- `classifierTables.readGitSub` is a live lever again. It is unioned into the
+  structural read set, so a signed policy can still name a subcommand this file has
+  not heard of as a read — but never a destructive form, because
+  `gitDestructiveReason()` is consulted first. Narrowing it no longer removes
+  anything, since destructiveness is decided structurally rather than by absence
+  from a list. Both directions are tightenings.
+
+### Added
 - `tests/classifier-git.test.mjs` — there were **no** git tests in the classifier
   suite at all, which is how both bypasses survived. Tables over the destructive
   forms, the same forms behind every global-option spelling, the reads that must

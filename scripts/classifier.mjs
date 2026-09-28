@@ -82,6 +82,9 @@ function defaultTables() {
       'chown', 'apt', 'apt-get', 'brew', 'systemctl', 'service',
     ],
     // git subcommands that only read.
+    // Unioned into the structural read set by isGitRead(); a signed policy can add a
+    // subcommand this file has not heard of. It can never make a destructive form a
+    // read — gitDestructiveReason() is checked first.
     readGitSub: [
       'status', 'log', 'diff', 'show', 'branch', 'remote', 'rev-parse',
       'describe', 'blame', 'tag', 'ls-files', 'cat-file',
@@ -301,54 +304,66 @@ function hasFlag(args, shorts, longs = []) {
  * @returns {string|null} why it is destructive, or null
  */
 export function gitDestructiveReason(sub, args) {
+  /** Irreversible: cannot be undone by whoever authorised it. */
+  const floor = (reason) => ({ reason, floorAsk: true })
+  /** Consequential but recoverable, or routine enough that a preset should decide. */
+  const high = (reason) => ({ reason, floorAsk: false })
+
   switch (sub) {
     case 'branch':
-      if (hasFlag(args, ['d', 'D'], ['--delete'])) return 'deletes a branch (git branch -d/-D)'
+      if (hasFlag(args, ['d', 'D'], ['--delete'])) return floor('deletes a branch (git branch -d/-D)')
       return null
     case 'tag':
-      if (hasFlag(args, ['d'], ['--delete'])) return 'deletes a tag (git tag -d)'
+      if (hasFlag(args, ['d'], ['--delete'])) return floor('deletes a tag (git tag -d)')
       return null
     case 'checkout':
-      // `git checkout -- <path>` and `git checkout .` discard uncommitted work.
-      // `-b` / `-B` create a branch and are not destructive.
+      // `-b`/`-B` create a branch; harmless.
       if (hasFlag(args, ['b', 'B'], ['--orphan'])) return null
       if (args.includes('--') || args.some((a) => a === '.' || a === './')) {
-        return 'discards uncommitted changes (git checkout -- <path>)'
+        return floor('discards uncommitted changes (git checkout -- <path>)')
       }
-      if (hasFlag(args, ['f'], ['--force'])) return 'force checkout discards local changes (git checkout -f)'
+      if (hasFlag(args, ['f'], ['--force'])) return floor('force checkout discards local changes (git checkout -f)')
       return null
     case 'restore':
-      // The modern spelling of the same thing; discards the working tree by default.
-      return 'discards uncommitted changes (git restore)'
+      return floor('discards uncommitted changes (git restore)')
     case 'stash':
-      if (args[0] === 'drop' || args[0] === 'clear') return `destroys stashed work (git stash ${args[0]})`
+      if (args[0] === 'drop' || args[0] === 'clear') return floor(`destroys stashed work (git stash ${args[0]})`)
       return null
     case 'reset':
-      if (hasFlag(args, [], ['--hard'])) return 'discards commits and working tree (git reset --hard)'
+      if (hasFlag(args, [], ['--hard'])) return floor('discards commits and working tree (git reset --hard)')
       return null
     case 'clean':
-      if (hasFlag(args, ['f', 'x', 'd'], ['--force'])) return 'deletes untracked files (git clean -f)'
+      if (hasFlag(args, ['f', 'x', 'd'], ['--force'])) return floor('deletes untracked files (git clean -f)')
       return null
     case 'push':
       if (hasFlag(args, ['f'], ['--force', '--force-with-lease', '--delete', '--mirror'])) {
-        return 'rewrites or deletes remote refs (git push --force/--delete)'
+        return floor('rewrites or deletes remote refs (git push --force/--delete)')
       }
-      return 'publishes to a remote (git push)'
+      // An ordinary push is consequential but adds commits rather than destroying
+      // them, and it is constant in normal work. Left for the preset to judge, which
+      // is the behaviour the pre-existing `git push` pattern already had.
+      return high('publishes to a remote (git push)')
+    case 'submodule':
+      // Discards a submodule's working tree, including local commits that were
+      // never pushed. Was rated `low`, i.e. allowed on every preset.
+      if (args[0] === 'deinit' && hasFlag(args, ['f'], ['--force'])) {
+        return floor('discards a submodule working tree (git submodule deinit -f)')
+      }
+      return null
     // ── the recovery path itself ────────────────────────────────────────────
-    // These are what turn a recoverable ref deletion into permanent loss. A
-    // deleted branch lives in the object store until it is pruned, which is the
-    // only reason 41 deleted branches were restorable. Destroying that is at
-    // least as consequential as the deletion it follows.
+    // A deleted ref survives in the object store until it is pruned, which is the
+    // only reason 41 deleted branches were recoverable. Destroying that is at least
+    // as consequential as the deletion it follows.
     case 'reflog':
-      if (args[0] === 'expire' || args[0] === 'delete') return `destroys the recovery log (git reflog ${args[0]})`
+      if (args[0] === 'expire' || args[0] === 'delete') return floor(`destroys the recovery log (git reflog ${args[0]})`)
       return null
     case 'gc':
-      if (hasFlag(args, [], ['--prune', '--aggressive'])) return 'prunes unreachable objects, ending recoverability (git gc --prune)'
+      if (hasFlag(args, [], ['--prune', '--aggressive'])) return floor('prunes unreachable objects, ending recoverability (git gc --prune)')
       return null
     case 'filter-branch':
-      return 'rewrites history across refs (git filter-branch)'
+      return floor('rewrites history across refs (git filter-branch)')
     case 'update-ref':
-      if (hasFlag(args, ['d'], ['--delete'])) return 'deletes a ref directly (git update-ref -d)'
+      if (hasFlag(args, ['d'], ['--delete'])) return floor('deletes a ref directly (git update-ref -d)')
       return null
     default:
       return null
@@ -368,17 +383,84 @@ const READ_SUBS = new Set([
   'ls-tree', 'show-ref', 'merge-base', 'shortlog', 'count-objects', 'fsck', 'reflog',
 ])
 
-/** Is this a read-only git invocation? Flags are already accounted for. */
-export function isGitRead(sub, args) {
+/**
+ * Is this a read-only git invocation? Flags are already accounted for.
+ *
+ * `extraReadSubs` is the signed policy's `classifierTables.readGitSub`, unioned in
+ * so that lever keeps working — a policy can still name a subcommand this file has
+ * not heard of as a read. It cannot go the other way: `gitDestructiveReason` is
+ * consulted first, so no policy can name a destructive form a read. Narrowing the
+ * list no longer removes anything from the read set either, because destructiveness
+ * is now decided structurally rather than by absence from a list. Both of those are
+ * tightenings.
+ */
+export function isGitRead(sub, args, extraReadSubs = []) {
   if (!sub) return false
   if (gitDestructiveReason(sub, args)) return false
-  if (!READ_SUBS.has(sub)) return false
+  if (!READ_SUBS.has(sub) && !extraReadSubs.includes(sub)) return false
   // A read subcommand that writes via a flag is not a read.
   if (sub === 'branch' && hasFlag(args, ['m', 'M', 'c', 'C'], ['--move', '--copy', '--edit-description', '--set-upstream-to', '--unset-upstream'])) return false
   if (sub === 'tag' && (hasFlag(args, ['a', 's', 'f'], ['--annotate', '--sign', '--force']) || args.some((a) => !a.startsWith('-')))) return false
   if (sub === 'reflog' && args[0] && args[0] !== 'show') return false
   return true
 }
+
+// ── floorAsk: consequences no preset may make silent ────────────────────────
+//
+// DANGEROUS denies and cannot be overridden. Everything below it is compared
+// against the preset's `escalateAt`, and the `permissive` preset sets that to
+// `dangerous` — so a HIGH-risk action resolves to ALLOW there. That is how an agent
+// deleted 41 branches with no prompt, and it is also how `npm publish`, `fly deploy`
+// and `rm -rf <dir>` run silently on the default production preset.
+//
+// floorAsk is the missing middle tier: it always ASKS, whatever `escalateAt` says,
+// and no preset can lower it. It is not a deny — deleting a merged branch and
+// publishing a release are both legitimate. It only means they may not happen
+// without someone seeing them.
+//
+// The bar for entry is deliberately narrow, because a floor that interrupts routine
+// work is a floor people switch off: the action cannot be undone by whoever
+// authorised it, and it either leaves this machine or destroys the only copy.
+// Ordinary `git push`, `gh pr merge`, `fly secrets set` and `psql` are left to the
+// presets for exactly that reason.
+const FLOOR_ASK_PATTERNS = [
+  // Publishing to a registry. A version number can never be reused: npm refuses a
+  // re-upload, and a crates.io yank does not remove the crate.
+  [/\b(npm|pnpm|yarn)\s+publish\b/i, 'publishes to the npm registry — a version number cannot be reused'],
+  [/\bnpm\s+unpublish\b/i, 'removes a published npm version others may depend on'],
+  [/\bcargo\s+publish\b/i, 'publishes to crates.io — permanent, a yank does not remove it'],
+  [/\bcargo\s+yank\b/i, 'yanks a published crate version'],
+  [/\btwine\s+upload\b/i, 'publishes to PyPI — a version number cannot be reused'],
+  [/\b(poetry|uv|flit)\s+publish\b/i, 'publishes a Python package — a version number cannot be reused'],
+
+  // Production deploys. Fly's target comes from fly.toml and is invisible in the
+  // command, so every `fly deploy` asks rather than guessing which app it hits.
+  [/\b(fly|flyctl)\s+deploy\b/i, 'deploys to Fly — the target app comes from fly.toml, not the command'],
+  [/\b(vercel|netlify)\b[^|&;]*--prod\b/i, 'deploys to production'],
+
+  // Destruction with no git reflog behind it.
+  [/\bshred\b/i, 'overwrites a file so it cannot be recovered'],
+  [/\brm\s+(-\S+\s+)*-\S*[rR]/, 'recursive delete — removes a directory tree'],
+  [/\bfind\b[^|&;]*\s-delete\b/i, 'deletes every matching file, unbounded by the match'],
+  [/\bfind\b[^|&;]*-exec\s+rm\b/i, 'deletes every matching file, unbounded by the match'],
+  [/\btruncate\b[^|&;]*-s\s*0\b/i, 'truncates a file to zero bytes'],
+
+  // Deleting a hosted artefact. Irreversible and it affects everyone else, not just
+  // this machine — the strongest form of the criterion.
+  [/\b(gh|glab)\s+repo\s+delete\b/i, 'deletes a hosted repository'],
+  [/\bgh\s+release\s+delete\b/i, 'deletes a published release'],
+
+  // Destroying a secret's only copy. `set`/`add` are additive and the value is in
+  // the operator's hands, so they stay with the presets; removal is one-way.
+  [/\b(fly|flyctl)\s+secrets\s+(unset|remove)\b/i, 'removes a secret — the value is not recoverable from here'],
+  [/\bvercel\s+env\s+(rm|remove)\b/i, 'removes an environment variable'],
+  [/\bgh\s+secret\s+(delete|remove)\b/i, 'removes a repository secret'],
+
+  // Resets the database. Unlike a bare `psql`, the command says outright that it is
+  // destructive; which environment it points at is not visible either way, which is
+  // precisely why it should not be silent.
+  [/\bsupabase\s+db\s+reset\b/i, 'resets the database, dropping its contents'],
+]
 
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
@@ -563,6 +645,21 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
   let category = CATEGORY.READ
   let boundary = BOUNDARY.NONE
   let reversible = true
+  let floorAsk = false
+
+  // floorAsk first. These also imply HIGH, so a receipt is always written
+  // (receiptTierFor keys off risk) and the reason names the consequence.
+  for (const [re, why] of FLOOR_ASK_PATTERNS) {
+    if (re.test(full)) {
+      floorAsk = true
+      risk = maxRisk(risk, RISK.HIGH)
+      category = CATEGORY.WRITE
+      boundary = unionBoundary(boundary, BOUNDARY.EGRESS)
+      reversible = false
+      reasons.push(`irreversible: ${why}`)
+      break
+    }
+  }
 
   if (anyMatch(HIGH_PATTERNS, full)) {
     risk = maxRisk(risk, RISK.HIGH)
@@ -603,8 +700,9 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
         boundary = unionBoundary(boundary, BOUNDARY.EGRESS)
         risk = maxRisk(risk, RISK.HIGH)
         reversible = false
-        reasons.push(`git destructive: ${destructive}`)
-      } else if (isGitRead(sub, args)) {
+        if (destructive.floorAsk) floorAsk = true
+        reasons.push(`git destructive: ${destructive.reason}`)
+      } else if (isGitRead(sub, args, tables.readGitSub ?? [])) {
         category = maxRisk(risk, RISK.SAFE) === RISK.SAFE ? CATEGORY.READ : category
         boundary = unionBoundary(boundary, BOUNDARY.INGRESS)
         reasons.push(`git read: ${sub || '(none)'}`)
@@ -641,7 +739,7 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
     }
   }
 
-  return { category, risk, boundary, reversible, reasons }
+  return { category, risk, boundary, reversible, reasons, floorAsk }
 }
 
 /**
@@ -650,8 +748,14 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
  * meets/exceeds `escalateAt` asks; below it allows. Default MEDIUM preserves
  * the prior behavior; the balanced preset raises it to HIGH ("medium = safe").
  */
-export function verdictForRisk(risk, escalateAt = RISK.MEDIUM) {
+export function verdictForRisk(risk, escalateAt = RISK.MEDIUM, floorAsk = false) {
   if (risk === RISK.DANGEROUS) return VERDICT.DENY
+  // floorAsk — the middle tier. Between "always denied" and "the preset decides"
+  // there has to be "never silent": an irreversible action may proceed, but not
+  // without someone seeing it. No `escalateAt` can lower this, which is the whole
+  // point — `permissive` sets escalateAt to `dangerous`, so without this every
+  // HIGH-risk action resolves to ALLOW there.
+  if (floorAsk) return VERDICT.ASK
   const threshold = RISK_RANK[escalateAt] ?? RISK_RANK[RISK.MEDIUM]
   if (RISK_RANK[risk] >= threshold) return VERDICT.ASK
   return VERDICT.ALLOW
@@ -714,7 +818,7 @@ export function classify(call, cfg = {}) {
   if (kind === 'exec') {
     const command = typeof input === 'string' ? input : input?.command ?? input?.cmd ?? ''
     const b = classifyBash(command, tables, cfg.guardPort)
-    return finalize(rawTool, b.category, b.risk, b.boundary, b.reversible, b.reasons, escalateAt)
+    return finalize(rawTool, b.category, b.risk, b.boundary, b.reversible, b.reasons, escalateAt, b.floorAsk)
   }
 
   if (kind === 'read') {
@@ -763,14 +867,17 @@ export function classify(call, cfg = {}) {
   return finalize(rawTool, category, risk, boundary, reversible, reasons, escalateAt)
 }
 
-function finalize(tool, category, risk, boundary, reversible, reasons, escalateAt) {
+function finalize(tool, category, risk, boundary, reversible, reasons, escalateAt, floorAsk = false) {
   return {
     tool,
     category,
     risk,
     boundary,
     reversible,
-    verdictHint: verdictForRisk(risk, escalateAt),
+    // Surfaced so a caller can tell "the preset asked" from "this may never be
+    // silent" — a receipt and an approval prompt want to say different things.
+    floorAsk,
+    verdictHint: verdictForRisk(risk, escalateAt, floorAsk),
     receiptTier: receiptTierFor(risk, boundary),
     reasons,
   }

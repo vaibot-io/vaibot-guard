@@ -206,7 +206,7 @@ test('everything after `--` is a pathspec, not a flag', () => {
   // A file genuinely named `-D` must not be read as the delete flag, and the flag
   // scan must stop at the separator.
   assert.equal(gitDestructiveReason('branch', ['--', '-D']), null, 'a pathspec named -D is not a flag')
-  assert.equal(gitDestructiveReason('branch', ['-D', 'x']), 'deletes a branch (git branch -d/-D)')
+  assert.equal(gitDestructiveReason('branch', ['-D', 'x'])?.reason, 'deletes a branch (git branch -d/-D)')
 })
 
 test('the shape that actually caused the incident', () => {
