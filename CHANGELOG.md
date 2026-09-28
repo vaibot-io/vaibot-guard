@@ -2,7 +2,58 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
-## [2.2.2] — 2026-09-28 — the floor reads git's flags, and finds its subcommand
+## [2.3.0] — 2026-09-28 — the floor reads git's flags; two new approval tiers
+
+### Added
+- **Approval leases — "allow for this session".** An approval prompt can now be
+  answered once for a scoped, expiring set of calls instead of once per call. It
+  suppresses the **prompt**, never the **audit**: every leased action still writes a
+  receipt, tagged with the lease it ran under and with what would otherwise have been
+  asked.
+
+  This is deliberately not the grant store `classifier.mjs` rules out in its opening
+  comment ("safe is COMPUTED on every call — never granted once and remembered"). Six
+  invariants are what make the difference, and each one has a test:
+
+  1. **Human-initiated.** The only path that mints a lease is a host reporting that a
+     person answered its prompt with `session`. Nothing an agent calls mints one, and
+     a host running with approvals bypassed (`--yolo`, `bypassPermissions`) cannot
+     mint one at all — there was no human to assert.
+  2. **Scoped.** `{host session} x {exec|tool} x {classifier category} x {command head
+     or tool name} x {optional directory prefix}`. Never a wildcard in any position.
+     The prefix is the realpath'd directory, so a `..` segment or a symlink cannot
+     widen it, and a call carrying no paths is not covered by a path-scoped lease.
+  3. **Ephemeral.** In memory only — 30 minutes by default, a hard four-hour ceiling
+     the environment cannot raise, a use count, and no survival across a restart.
+     Nothing is written to disk, so there is nothing on disk to poison.
+  4. **Floor-preserving.** Only `approve` becomes `allow`. A deny is untouched, the
+     catastrophic floor is untouched, and **`floorAsk` is never leasable** — an
+     irreversible action asks every single time no matter how many leases exist. That
+     is the whole point of `floorAsk`, and a lease that could cover it would erase it.
+  5. **Dead on a change of rules.** A policy change, a mode change, or containment
+     arming invalidates every lease immediately. Checked on every use, not only at
+     mint, so a long-running call cannot mint a lease for rules that changed while it
+     ran.
+  6. **Revocable.** `/v1/leases/revoke` takes one `leaseId`, or `all: true` to drop
+     every lease on the machine. Revocation needs no second factor: unlike granting,
+     it can only ever make the guard stricter.
+
+  **The host chooses *whether*; the guard chooses *what*.** The scope is computed by
+  the guard at decide time from the real, unredacted call and stashed with the run, so
+  a host can say "session" but can never choose how much that covers.
+
+  **Trust, stated rather than implied:** the guard cannot verify that a human pressed
+  the key — the host asserts it, and `/v1/approvals/resolve` is authenticated by the
+  same shared token the breakers use to ask questions. That is exactly why a lease is
+  scoped, expiring, floor-preserving, and recorded as `grantedBy: "host-prompt"`
+  rather than as a verified human. A host offering "always" gets a session-length
+  lease and nothing durable.
+
+- `/v1/leases/list` and `/v1/leases/revoke`; `approval-lease` in the guard's
+  advertised capabilities so a breaker or the CLI can detect support.
+- `tests/guard-approval-lease.test.mjs` — twelve tests, one per invariant, driven
+  through a live daemon and a mock control plane so the mode-change and containment
+  cases actually flip rather than asserting inside an `if` that never fires.
 
 ### Fixed
 - **`git -C <path> …` laundered every destructive git command the floor guarded.**

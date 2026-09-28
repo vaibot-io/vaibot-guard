@@ -149,7 +149,7 @@ const INSTANCE_ID = randomUUID();
 //                       than enforce its own default.
 //   rule-id           — escalations and denials carry `decision.ruleId`, the
 //                       policy rule (and subject) that fired.
-const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id"]);
+const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease"]);
 
 const VAIBOT_LOG_RETENTION_DAYS = Math.max(1, Number(process.env.VAIBOT_LOG_RETENTION_DAYS || 14));
 
@@ -285,6 +285,18 @@ function applyLoadedBundle(loadResult) {
 // honor an authoritative "no active policy" (revoked) by reverting to built-in
 // defaults — the hard-coded destructive floor still applies, so a revocation can
 // only drop user-added denials, never relax the safety net.
+// Lease state, declared here rather than beside the lease functions below: the
+// initial refreshPolicy() call in this module's own init path invalidates leases,
+// and a `const` is not hoisted — declaring it later made the daemon die at boot
+// with 'Cannot access LEASES before initialization'.
+const LEASES = new Map(); // leaseId -> record (in-memory, never persisted)
+
+const LEASE_DEFAULT_TTL_MS = Math.max(60_000, Number(process.env.VAIBOT_LEASE_TTL_MS || 30 * 60_000));
+// A ceiling the environment cannot raise. A lease is a convenience, not a posture.
+const LEASE_MAX_TTL_MS = 4 * 60 * 60_000;
+// Bounds a pathological session; a lease is not a licence for unlimited volume.
+const LEASE_MAX_USES = Math.max(1, Number(process.env.VAIBOT_LEASE_MAX_USES || 250));
+
 async function refreshPolicy() {
   const url = POLICY_URL;
   if (!url || !POLICY_PUBKEY) return;
@@ -336,6 +348,8 @@ async function refreshPolicy() {
     }
     applyLoadedBundle({ ok: true, reason: "ok", policy: bundle.policy, bundle });
     if (changed) {
+      // The rules a lease was granted under are gone.
+      invalidateLeases(`policy changed to version ${bundle.version || "?"}`);
       // scope: 'account' = this account's own policy, 'default' = the admin's.
       const tier = data.scope === "account" ? "account" : "default";
       console.error(`[vaibot-guard] policy applied from control plane (version ${bundle.version || "?"}, ${tier}).`);
@@ -344,6 +358,7 @@ async function refreshPolicy() {
     // Authoritative withdrawal/revocation: server reports no active policy.
     console.error("[vaibot-guard] control plane reports no active policy (revoked) — reverting to built-in defaults.");
     try { fs.rmSync(POLICY_BUNDLE_PATH, { force: true }); } catch { /* best effort */ }
+    invalidateLeases("policy revoked — reverting to built-in defaults");
     applyLoadedBundle({ ok: false, reason: "revoked", policy: null, bundle: null });
   }
 }
@@ -432,6 +447,10 @@ function adoptContainment(v, source) {
   if (typeof v !== "boolean") return false;
   if (v === CONTAINMENT_ARMED) return false;
   CONTAINMENT_ARMED = v;
+  // Containment is rung 0. A lease is an "allow" and must not survive it; and on
+  // release, the operator should have to re-grant deliberately rather than find
+  // stale leases waiting.
+  invalidateLeases(v ? "containment armed" : "containment cleared");
   persistContainment(v, v ? CONTAINMENT_REASON : null);
   console.error(`[vaibot-guard] containment ${v ? "ARMED" : "cleared"} (${source}).`);
   return true;
@@ -502,7 +521,10 @@ async function refreshEffectiveMode() {
     const m = data?.enforcement?.effective_mode;
     if (m !== "observe" && m !== "enforce") return; // malformed/absent → fail-static
     if (m !== EFFECTIVE_MODE) {
+      const previous = EFFECTIVE_MODE;
       EFFECTIVE_MODE = m;
+      // A lease granted under one mode does not carry into another.
+      invalidateLeases(`effective mode changed ${previous} -> ${m}`);
       republishMode();
       console.error(`[vaibot-guard] effective mode = '${m}' (control plane).`);
     }
@@ -703,6 +725,286 @@ function markApprovalUsed({ approvalId }) {
   rec.usedAt = nowIso();
   writeApproval(rec);
 }
+
+// ---- Approval leases --------------------------------------------------------
+//
+// "Allow for this session." A lease suppresses the PROMPT for a scoped, expiring
+// set of calls. It never suppresses the AUDIT: every leased action still writes a
+// receipt, tagged with the lease it ran under.
+//
+// This is deliberately NOT the grant store the classifier's opening comment rules
+// out ("safe is COMPUTED on every call — never granted once and remembered"). The
+// difference is in the invariants, all of which are load-bearing:
+//
+//   1. HUMAN-INITIATED. A lease is minted only when a host reports that a person
+//      answered its approval prompt with "session" (APPROVAL_CHOICES). Nothing the
+//      agent can call mints one.
+//   2. SCOPED. {session} x {kind} x {classifier category} x {tool name or command
+//      head} x {optional path prefix}. Never a wildcard in any position.
+//   3. TIME-BOXED, and in memory only — so it cannot survive a restart, cannot be
+//      written by anything but this process, and cannot be poisoned on disk.
+//   4. FLOOR-PRESERVING. Only `approve` -> `allow`, and never when the classifier
+//      set `floorAsk`. A deny is untouched, the catastrophic floor is untouched, and
+//      an irreversible action still asks every single time. That is the whole reason
+//      floorAsk exists, and a lease that could cover it would erase it.
+//   5. DEAD ON A CHANGE OF RULES. A lease granted under one policy or one mode does
+//      not survive into another. Both are checked on every use, not just at mint.
+//   6. REVOCABLE, and listable, in one command.
+//
+// KNOWN AND ACCEPTED TRUST: the guard cannot verify that a human pressed the key.
+// The host asserts it. `/v1/approvals/resolve` is authenticated by the same shared
+// guard token the breakers use to ask questions, so a token-holder could assert it
+// too — which is exactly why a lease can never cover a floorAsk action, why it is
+// scoped and expiring, and why the receipt names the host as the authority rather
+// than claiming a verified human. A host running with approvals bypassed (--yolo,
+// bypassPermissions) cannot mint one at all.
+/** The signed bundle version in force, or null under built-in defaults. */
+function currentPolicyVersion() {
+  return SIGNED_POLICY?.source === "bundle" ? (POLICY_BUNDLE?.bundle?.version ?? null) : null;
+}
+
+function leaseExpired(rec) {
+  return Boolean(rec?.expiresAt) && Date.now() > Date.parse(rec.expiresAt);
+}
+
+/**
+ * Why this lease is not usable right now, or null if it is.
+ * Split out from leaseCovers() so `leases list` can say what happened to a lease
+ * instead of silently omitting it.
+ */
+function leaseDeadReason(rec) {
+  if (rec.revokedAt) return "revoked";
+  if (leaseExpired(rec)) return "expired";
+  if (rec.uses >= rec.maxUses) return "exhausted";
+  if (rec.mode !== EFFECTIVE_MODE) return `mode changed (${rec.mode} -> ${EFFECTIVE_MODE})`;
+  if (rec.policyVersion !== currentPolicyVersion()) return "policy changed";
+  if (CONTAINMENT_ARMED) return "containment armed";
+  return null;
+}
+
+/** Drop leases that can never be used again. */
+function pruneLeases() {
+  for (const [id, rec] of LEASES) {
+    const dead = leaseDeadReason(rec);
+    if (dead && dead !== "containment armed") LEASES.delete(id);
+  }
+}
+
+/**
+ * Kill every lease. Called when the rules change underneath them — a policy
+ * refresh, a mode flip, or containment arming. Invariant 5.
+ */
+function invalidateLeases(why) {
+  if (LEASES.size === 0) return 0;
+  const n = LEASES.size;
+  LEASES.clear();
+  console.error(`[vaibot-guard] ${n} approval lease(s) invalidated: ${why}.`);
+  return n;
+}
+
+/** Case/whitespace-insensitive subject comparison. Local: classifier.mjs has its
+ *  own `norm`, which is not exported and should not be widened for this. */
+function leaseNorm(v) {
+  return String(v ?? "").trim().toLowerCase();
+}
+
+/** The scope a call presents, for comparison against a lease. */
+function leaseScopeForCall({ kind, category, toolName, cmd, paths }) {
+  return {
+    kind,
+    category: category ?? null,
+    // For exec the command head is the family; for a tool it is the tool name.
+    subject: kind === "exec" ? leaseNorm(leadingWordOf(cmd)) : leaseNorm(toolName),
+    paths: Array.isArray(paths) ? paths.filter(Boolean) : [],
+  };
+}
+
+function leadingWordOf(cmd) {
+  const t = String(cmd || "").trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < t.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(t[i])) i++;
+  return t[i] ?? "";
+}
+
+/** Does this lease cover this call? Every invariant is re-checked here, not at mint. */
+function leaseCovers(rec, scope) {
+  if (leaseDeadReason(rec)) return false;
+  if (rec.kind !== scope.kind) return false;
+  if (rec.category !== scope.category) return false;
+  if (rec.subject !== scope.subject) return false;
+  if (rec.pathPrefix) {
+    // Every path the call touches must be under the granted prefix. A call with no
+    // paths is NOT covered by a path-scoped lease — absence is not containment.
+    if (scope.paths.length === 0) return false;
+    for (const p of scope.paths) {
+      // Defensive: anything that is not a usable string fails closed rather than
+      // throwing inside a decision. `resolveIntentPath` returns an OBJECT, and
+      // passing it here once turned every tool decision into a 500.
+      if (typeof p !== "string" || !p) return false;
+      let rel;
+      try {
+        rel = path.relative(rec.pathPrefix, p);
+      } catch {
+        return false;
+      }
+      if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+    }
+  }
+  return true;
+}
+
+function findLeaseFor(sessionId, scope) {
+  for (const rec of LEASES.values()) {
+    if (rec.sessionId !== sessionId) continue; // host session, per Briant's call
+    if (leaseCovers(rec, scope)) return rec;
+  }
+  return null;
+}
+
+/**
+ * Mint a lease. Invariant 1: reachable only from a host-reported `session` choice
+ * on an approval that this guard itself raised.
+ */
+function grantLease({ sessionId, kind, category, subject, pathPrefix, hostSurface, ttlMs }) {
+  if (!sessionId || !kind || !subject) return null;
+  const ttl = Math.min(LEASE_MAX_TTL_MS, Math.max(60_000, Number(ttlMs) || LEASE_DEFAULT_TTL_MS));
+  const rec = {
+    schema: "vaibot-guard/lease@0.1",
+    leaseId: `lease_${randomUUID()}`,
+    sessionId,
+    kind,
+    category: category ?? null,
+    subject,
+    pathPrefix: pathPrefix || null,
+    // Named honestly: the host asserted a human chose this. The guard did not see it.
+    grantedBy: "host-prompt",
+    hostSurface: hostSurface || null,
+    mode: EFFECTIVE_MODE,
+    policyVersion: currentPolicyVersion(),
+    createdAt: nowIso(),
+    expiresAt: new Date(Date.now() + ttl).toISOString(),
+    ttlMs: ttl,
+    uses: 0,
+    maxUses: LEASE_MAX_USES,
+    lastUsedAt: null,
+    revokedAt: null,
+  };
+  LEASES.set(rec.leaseId, rec);
+  console.error(
+    `[vaibot-guard] lease ${rec.leaseId} granted: ${kind}/${subject}` +
+      `${pathPrefix ? ` under ${pathPrefix}` : ""} for ${Math.round(ttl / 60_000)}min (session ${sessionId}).`,
+  );
+  return rec;
+}
+
+/**
+ * The lease this call would justify, if a human later answers "session".
+ *
+ * Computed at DECIDE time, by the guard, from the real (unredacted) call, and
+ * stashed in the run context. So the host can choose *whether* a lease is granted;
+ * it can never choose *what* the lease covers. That split is what makes tolerating a
+ * host-asserted "session" reasonable at all.
+ *
+ * Returns null when nothing should be leasable: not an escalation, or floorAsk.
+ */
+function leaseCandidateFor({ decision, floorAsk, kind, category, toolName, cmd, paths }) {
+  if (decision?.decision !== "approve") return null;
+  if (floorAsk) return null; // invariant 4, enforced at mint as well as at use
+  const subject = kind === "exec" ? leaseNorm(leadingWordOf(cmd)) : leaseNorm(toolName);
+  if (!subject) return null;
+  // Scope to the DIRECTORY of the path involved, never the file, so a second edit in
+  // the same place is covered while an edit elsewhere is not. No path -> no path
+  // scope, and leaseCovers() then refuses any call that does carry paths.
+  const first = Array.isArray(paths) ? paths.find((p) => typeof p === "string" && p) : null;
+  return { kind, category: category ?? null, subject, pathPrefix: first ? path.dirname(first) : null };
+}
+
+/**
+ * Invariant 1, in one place: the ONLY path that mints a lease.
+ *
+ * Called from finalize, where a host reports how its human answered. Every guard
+ * against a bad grant is here:
+ *   - the answer must literally be "session" (APPROVAL_CHOICES)
+ *   - the guard must have stashed a candidate for that run, which it only does for
+ *     an escalation that was not floorAsk
+ *   - a host running with approvals bypassed cannot mint at all — there was no human
+ *   - containment must not be armed
+ * Anything else is a no-op, silently, because a failed mint must never fail a
+ * finalize; the worst case is one more prompt.
+ */
+function maybeGrantLeaseFromFinalize({ ctx, result, sessionId, hostBypass }) {
+  try {
+    if (CONTAINMENT_ARMED) return null;
+    if (hostBypass?.active === true) return null;
+    const candidate = ctx?.leaseCandidate;
+    if (!candidate || typeof candidate !== "object") return null;
+    const host = hostApprovalFrom(result?.hostApproval);
+    const choice = host?.choice || (APPROVAL_CHOICES.has(result?.approvalChoice) ? result.approvalChoice : null);
+    // "always" is deliberately NOT honoured: this guard mints nothing durable (D-141).
+    // A host offering "always" gets a session-length lease, and says so in the receipt.
+    if (choice !== "session" && choice !== "always") return null;
+    // The mode/policy a lease is minted under must be the one in force now, not the
+    // one the run started under — otherwise a long-running call could mint a lease
+    // for rules that changed while it ran.
+    if (ctx.effectiveMode && ctx.effectiveMode !== EFFECTIVE_MODE) return null;
+    return grantLease({
+      sessionId,
+      kind: candidate.kind,
+      category: candidate.category,
+      subject: candidate.subject,
+      pathPrefix: candidate.pathPrefix,
+      hostSurface: host?.surface || null,
+    });
+  } catch {
+    return null; // a lease is a convenience; never let it break a finalize
+  }
+}
+
+function revokeLease(leaseId) {
+  const rec = LEASES.get(leaseId);
+  if (!rec) return { ok: false, error: "Lease not found" };
+  if (rec.revokedAt) return { ok: false, error: "Lease already revoked" };
+  rec.revokedAt = nowIso();
+  console.error(`[vaibot-guard] lease ${leaseId} revoked.`);
+  return { ok: true, leaseId, revokedAt: rec.revokedAt };
+}
+
+function listLeases({ sessionId } = {}) {
+  const out = [];
+  for (const rec of LEASES.values()) {
+    if (sessionId && rec.sessionId !== sessionId) continue;
+    out.push({ ...rec, dead: leaseDeadReason(rec) });
+  }
+  out.sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
+  return out;
+}
+
+/**
+ * Turn an `approve` into an `allow` when a lease covers it. Invariant 4 lives here:
+ * `floorAsk` is refused outright, so an irreversible action asks every time no
+ * matter how many leases exist.
+ *
+ * Runs AFTER applyHostBypass, so an escalation the policy blocked under a bypass
+ * stays blocked — a lease can never resurrect a deny.
+ */
+function applyLease(decision, { sessionId, floorAsk, scope }) {
+  if (decision?.decision !== "approve") return decision;
+  if (floorAsk) return decision; // never leasable, by construction
+  const rec = findLeaseFor(sessionId, scope);
+  if (!rec) return decision;
+  rec.uses += 1;
+  rec.lastUsedAt = nowIso();
+  return {
+    decision: "allow",
+    reason: `Allowed under lease ${rec.leaseId} (would otherwise ask: ${decision.reason})`,
+    leaseId: rec.leaseId,
+    // The receipt vocabulary already had this scope; now something produces it.
+    approvalScope: "session-grant",
+    ...(decision.risk !== undefined ? { risk: decision.risk } : {}),
+    ...(decision.ruleId ? { ruleId: decision.ruleId } : {}),
+  };
+}
+
 
 function runCtxPath(runId) {
   return path.join(RUNCTX_DIR, `${runId}.json`);
@@ -2039,6 +2341,34 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, approvals });
     }
 
+    if (req.method === "POST" && req.url === "/v1/leases/list") {
+      if (!requireAuth(req, res)) return;
+      const raw = await readBody(req);
+      let input = {};
+      try { input = JSON.parse(raw || "{}"); } catch { /* list-all on bad JSON */ }
+      pruneLeases();
+      const sessionId = input?.sessionId ? String(input.sessionId) : undefined;
+      return json(res, 200, { ok: true, leases: listLeases({ sessionId }) });
+    }
+
+    if (req.method === "POST" && req.url === "/v1/leases/revoke") {
+      if (!requireAuth(req, res)) return;
+      const raw = await readBody(req);
+      let input;
+      try { input = JSON.parse(raw || "{}"); } catch { return json(res, 400, { ok: false, error: "Invalid JSON" }); }
+      // `all: true` is the panic path — one call drops every lease on the machine.
+      // Revocation is always safe to allow: it can only ever make the guard stricter,
+      // so unlike granting it needs no second factor.
+      if (input?.all === true) {
+        const n = invalidateLeases("revoked by operator");
+        return json(res, 200, { ok: true, revoked: n });
+      }
+      const leaseId = String(input?.leaseId || "");
+      if (!leaseId) return json(res, 400, { ok: false, error: "Missing leaseId" });
+      const out = revokeLease(leaseId);
+      return json(res, out.ok ? 200 : 400, out);
+    }
+
     if (req.method === "POST" && req.url === "/v1/approvals/resolve") {
       if (!requireAuth(req, res)) return;
       const raw = await readBody(req);
@@ -2079,15 +2409,31 @@ const server = http.createServer(async (req, res) => {
       const risk = classifyRisk({ intent, cmd, args });
       const receiptTier = receiptTierForExec(cmd, args);
       const hostBypass = parseHostBypass(input.hostBypass);
-      const decision = applyHostBypass(decideExec({ sessionId, cmd, args, intent }), hostBypass);
+      // One classify, used for both the receipt's risk and the lease scope, so the
+      // two can never disagree about what this call is.
+      let execCls = null;
+      try {
+        execCls = classify(
+          { tool: "exec", input: { command: [cmd, ...(args || [])].join(" ") } },
+          { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT },
+        );
+      } catch { /* leave null — treated as floorAsk below, i.e. not leasable */ }
+      let decision = applyHostBypass(decideExec({ sessionId, cmd, args, intent }), hostBypass);
+      // A lease can only ever turn `approve` into `allow`. If classify() threw,
+      // execCls is null and `!== false` yields true, so an unreadable call is treated
+      // as floorAsk and is NOT leasable — an error must not become a grant.
+      if (!hostBypass.active) {
+        decision = applyLease(decision, {
+          sessionId,
+          floorAsk: execCls?.floorAsk !== false,
+          scope: leaseScopeForCall({ kind: "exec", category: execCls?.category ?? null, cmd, paths: [] }),
+        });
+      }
       // Receipt honesty: fold the fine-grained classifier's risk into the coarse structural
       // risk so risk_level reflects what actually drove the gate on EVERY decision path
       // (approveToken / deny-token / catastrophic-floor), not only the allow/escalate
       // returns. Same classify() inputs as decideExec, so risk matches the decision.
-      try {
-        const clsRisk = classify({ tool: "exec", input: { command: [cmd, ...(args || [])].join(" ") } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT }).risk;
-        risk.risk = mergeReceiptRisk(risk.risk, clsRisk);
-      } catch { /* keep coarse risk on classifier error */ }
+      if (execCls) risk.risk = mergeReceiptRisk(risk.risk, execCls.risk);
       const runId = `run_${randomUUID()}`;
 
       const eventId = randomUUID();
@@ -2164,7 +2510,8 @@ const server = http.createServer(async (req, res) => {
       // Store context for finalize (persisted).
       // effectiveMode is captured at DECIDE time: the mode that actually
       // governed this action, not whatever the poll has drifted to by finalize.
-      writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version, effectiveMode: EFFECTIVE_MODE, hostBypass });
+      writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version, effectiveMode: EFFECTIVE_MODE, hostBypass,
+        leaseCandidate: leaseCandidateFor({ decision, floorAsk: execCls?.floorAsk !== false, kind: "exec", category: execCls?.category ?? null, cmd, paths: [] }) });
 
       return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION, contained: CONTAINMENT_ARMED });
     }
@@ -2191,10 +2538,22 @@ const server = http.createServer(async (req, res) => {
       // Receipt honesty: fold the fine-grained classifier's risk into the coarse tool risk
       // so risk_level matches the decision on every path (see the exec handler note). Same
       // classify() inputs as decideTool.
+      // One classify for the receipt's risk, the lease scope, and the floorAsk check,
+      // so they can never disagree about what this call is.
+      let toolCls = null;
       try {
-        const clsRisk = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT }).risk;
-        risk.risk = mergeReceiptRisk(risk.risk, clsRisk);
-      } catch { /* keep coarse risk on classifier error */ }
+        toolCls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT });
+      } catch { /* null => treated as floorAsk => not leasable */ }
+      if (toolCls) risk.risk = mergeReceiptRisk(risk.risk, toolCls.risk);
+      // Resolved once: used for the lease scope at both use and mint. `.full` is the
+      // realpath'd form — the same field the workspace boundary compares — so a lease
+      // scoped to a directory cannot be escaped with a symlink or a `..` segment.
+      let toolLeasePaths = [];
+      try {
+        toolLeasePaths = extractPathsFromToolParams(params)
+          .map((p) => resolveIntentPath(p, workspaceDir)?.full)
+          .filter((p) => typeof p === "string" && p.length > 0);
+      } catch { /* no paths => no path-scoped lease; never break the decision */ }
 
       const paramsHash = `sha256:${sha256(stableStringify({ toolName, params }))}`;
       const approvalId = String(input?.approval?.approvalId || "");
@@ -2234,6 +2593,21 @@ const server = http.createServer(async (req, res) => {
         // Applied before an approval record is minted: an escalation the policy
         // blocks under a host bypass never becomes a redeemable approval.
         decision = applyHostBypass(decideTool({ sessionId, toolName, params, workspaceDir }), hostBypass);
+
+        // Before minting an approval record: a leased call needs no approval, so it
+        // must not leave a pending one behind for someone to resolve later.
+        if (!hostBypass.active) {
+          decision = applyLease(decision, {
+            sessionId,
+            floorAsk: toolCls?.floorAsk !== false,
+            scope: leaseScopeForCall({
+              kind: "tool",
+              category: toolCls?.category ?? null,
+              toolName,
+              paths: toolLeasePaths,
+            }),
+          });
+        }
 
         // If policy requires approval, mint an approval record for chat-command resolution.
         if (decision && decision.decision === "approve") {
@@ -2342,6 +2716,14 @@ const server = http.createServer(async (req, res) => {
         policyVersion: POLICY.version,
         effectiveMode: EFFECTIVE_MODE,
         hostBypass,
+        leaseCandidate: leaseCandidateFor({
+          decision,
+          floorAsk: toolCls?.floorAsk !== false,
+          kind: "tool",
+          category: toolCls?.category ?? null,
+          toolName,
+          paths: toolLeasePaths,
+        }),
       });
 
       return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE, host_bypass_action: EFFECTIVE_HOST_BYPASS_ACTION, contained: CONTAINMENT_ARMED });
@@ -2365,6 +2747,10 @@ const server = http.createServer(async (req, res) => {
 
       const ctx1 = readRunContext(runId);
       const effectiveSessionId = String(ctx1?.sessionId || sessionId || "unknown-session");
+      // "Allow for this session" — the host reports the human's answer here. Both
+      // finalize routes (exec and tool) go through this, and it is the only place a
+      // lease is ever created.
+      maybeGrantLeaseFromFinalize({ ctx: ctx1, result, sessionId: effectiveSessionId, hostBypass: ctx1?.hostBypass });
 
       const eventId = randomUUID();
       const audit = appendAudit({
@@ -2469,6 +2855,10 @@ const server = http.createServer(async (req, res) => {
 
       const ctx1 = readRunContext(runId);
       const effectiveSessionId = String(ctx1?.sessionId || sessionId || "unknown-session");
+      // "Allow for this session" — the host reports the human's answer here. Both
+      // finalize routes (exec and tool) go through this, and it is the only place a
+      // lease is ever created.
+      maybeGrantLeaseFromFinalize({ ctx: ctx1, result, sessionId: effectiveSessionId, hostBypass: ctx1?.hostBypass });
 
       const eventId = randomUUID();
       const audit = appendAudit({
