@@ -2842,7 +2842,21 @@ const server = http.createServer(async (req, res) => {
           decision = { decision: "deny", reason: "Approval kind mismatch" };
         } else if (appr.sessionId && appr.sessionId !== sessionId) {
           decision = { decision: "deny", reason: "Approval session mismatch" };
+        } else if (appr.status === "pending") {
+          // `pending` is the ABSENCE of an answer, not a rejection. Denying here
+          // turned "the human hasn't replied yet" into "the human said no": the
+          // host surfaced a hard denial instead of a prompt, so the question
+          // never reached anyone — and the record stayed pending forever, which
+          // is where the dashboard's orphaned approvals come from.
+          //
+          // Re-issue the escalation carrying the SAME approvalId so the host
+          // asks again and this record gets resolved rather than abandoned.
+          // Safe: policy is re-evaluated, so a deny still denies; `used` below
+          // still blocks replay; the worst case is being asked twice.
+          const fresh = decideTool({ sessionId, toolName, params, workspaceDir });
+          decision = fresh.decision === "deny" ? fresh : { ...fresh, approvalId };
         } else if (appr.status !== "approved") {
+          // Terminal states only: denied / used / expired are real rejections.
           decision = { decision: "deny", reason: `Approval not approved (status=${appr.status})` };
         } else if (appr.expiresAt && Date.now() > Date.parse(appr.expiresAt)) {
           decision = { decision: "deny", reason: "Approval expired" };
