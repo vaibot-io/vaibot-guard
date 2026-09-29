@@ -653,7 +653,11 @@ function persistContainment(armed, reason = null) {
 }
 
 function containmentDecision() {
-  return { decision: "deny", reason: "VAIBot containment engaged — all actions blocked (Tier-0).", floor: true };
+  // ruleId lets the agent-facing guidance distinguish containment from an
+  // ordinary floor hit. Safe to carry: containment short-circuits decideExec /
+  // decideTool before any lease, batch or grant lookup, so this id can never be
+  // used to pre-approve a way past it.
+  return { decision: "deny", reason: "VAIBot containment engaged — all actions blocked (Tier-0).", floor: true, ruleId: "containment" };
 }
 // FAIL-STATIC: only an explicit boolean flips containment; a malformed/absent value keeps the
 // last-known state so a transient poll blip can never silently LIFT containment.
@@ -1548,18 +1552,81 @@ function parseHostBypass(raw) {
 // the catastrophic floor included — and an allow pass through untouched.
 function applyHostBypass(decision, hostBypass) {
   if (!hostBypass.active || decision?.decision !== "approve") return decision;
-  if (EFFECTIVE_HOST_BYPASS_ACTION === "approve") return { ...decision, bypassOverride: true };
+  if (EFFECTIVE_HOST_BYPASS_ACTION === "approve") {
+    // The escalation stands, but the host grants it without a human. Carrying the
+    // stock "a human must approve this" guidance would be a lie, so restate it.
+    return {
+      ...decision,
+      bypassOverride: true,
+      guidance:
+        "This needed human approval, but the agent host is set to bypass approvals and policy allows that, so it proceeds without review. Tell the user it ran unreviewed.",
+    };
+  }
   const via = hostBypass.mechanism ? ` (${hostBypass.mechanism})` : "";
   return {
     decision: "deny",
     reason: `Approval bypass is active${via}, and policy blocks actions that need approval while it is. Needed approval for: ${decision.reason}`,
+    guidance:
+      "This needed human approval, but the agent host has approvals bypassed, so policy blocked it rather than letting it through unreviewed. Do not retry and do not route around it — tell the user to turn the host's approval bypass off.",
     ...(decision.ruleId ? { ruleId: decision.ruleId } : {}),
     ...(decision.risk !== undefined ? { risk: decision.risk } : {}),
     bypassBlocked: true,
   };
 }
 
-function decideExec({ sessionId, cmd, args, intent }) {
+// ---- Agent-facing guidance -------------------------------------------------
+// `reason` says WHAT happened and is the record of the decision: it goes into
+// the receipt, the audit log and the dashboard, so it stays terse and stable.
+// `guidance` says WHAT THE AGENT SHOULD DO NEXT. Clients prefer it over
+// `reason` when present and fall back to `reason` when it is absent, so an
+// older plugin keeps working unchanged.
+//
+// Two rules for editing this table:
+//  1. Guidance NEVER names the matched token, pattern or policy entry. `reason`
+//     carries that for the human reading the receipt. Telling an agent which
+//     token tripped tells it which token to avoid — see the same constraint on
+//     the MCP server instructions.
+//  2. Only a malformed call should be told to retry. Every other lane must say
+//     "do not retry", because the verdict will not change on its own.
+const GUIDANCE_MALFORMED =
+  "The call was malformed, so it could not be governed. Fix the call and reissue it.";
+const GUIDANCE_FLOOR =
+  "This is a permanent safety rule. Approval cannot override it — do not request approval and do not retry. Tell the user what was blocked, then find another way to reach their goal.";
+const GUIDANCE_POLICY_DENY =
+  "This is blocked by the account's policy, not by a malformed call. Do not retry it and do not reword it to get a different verdict. If the action is genuinely needed, say so to the user and let them decide whether to change the policy.";
+const GUIDANCE_ASK =
+  "A human must approve this before it runs. Do not retry and do not attempt another route to the same effect — wait for the decision, and tell the user what is waiting on them.";
+
+function guidanceFor(d) {
+  if (!d || typeof d !== "object") return d;
+  const decision = d.decision;
+  if (decision === "allow") return d; // nothing to steer
+
+  // ruleIdFor() renders `${kind}:${subject}`, or a bare kind when the subject
+  // is empty — so the kind is everything before the first colon.
+  const kind = String(d.ruleId || "").split(":")[0];
+
+  // Checked before `floor` because containment also carries floor:true, and the
+  // containment message is the more useful of the two.
+  if (kind === "containment") {
+    return {
+      ...d,
+      guidance:
+        "Containment is engaged: every action is blocked until a human lifts it. Do not retry — tell the user that VAIBot is in containment.",
+    };
+  }
+  if (d.floor === true) return { ...d, guidance: GUIDANCE_FLOOR };
+  if (kind === "intent-invalid" || kind === "tool-missing") {
+    return { ...d, guidance: GUIDANCE_MALFORMED };
+  }
+  return { ...d, guidance: decision === "deny" ? GUIDANCE_POLICY_DENY : GUIDANCE_ASK };
+}
+
+function decideExec(params) {
+  return guidanceFor(decideExecInner(params));
+}
+
+function decideExecInner({ sessionId, cmd, args, intent }) {
   if (CONTAINMENT_ARMED) return containmentDecision();
   const err = validateIntent(intent);
   if (err) return { decision: "deny", reason: err, ruleId: "intent-invalid" };
@@ -1738,7 +1805,11 @@ function classifyToolRisk({ toolName, params, workspaceDir }) {
   return { risk: "low", reason: "default low risk" };
 }
 
-function decideTool({ sessionId, toolName, params, workspaceDir }) {
+function decideTool(params) {
+  return guidanceFor(decideToolInner(params));
+}
+
+function decideToolInner({ sessionId, toolName, params, workspaceDir }) {
   if (CONTAINMENT_ARMED) return containmentDecision();
   const tn = String(toolName || "");
   // Fail-closed: an unidentified tool call cannot be governed → deny.
