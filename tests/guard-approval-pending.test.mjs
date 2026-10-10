@@ -28,7 +28,7 @@ const POLICY_PATH = path.resolve(__dirname, "..", "references", "policy.default.
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vaibot-guard-apprpend-"));
 const servers = [];
 
-async function startGuard(label) {
+async function startGuard(label, extraEnv = {}) {
   const port = await reservePort();
   const token = "approval-pending-token";
   const logDir = path.join(tmpRoot, `logs-${label}`);
@@ -47,6 +47,7 @@ async function startGuard(label) {
       VAIBOT_GUARD_LOG_DIR: logDir,
       VAIBOT_PROVE_MODE: "off",
       VAIBOT_POLICY_URL: "off",
+      ...extraEnv,
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -165,4 +166,74 @@ test("re-asking re-evaluates policy: a floor call is denied, not re-escalated", 
   });
   assert.equal(floored.data.decision.decision, "deny");
   assert.equal(floored.data.decision.floor, true, "the catastrophic floor still wins over a pending id");
+});
+
+// A pending id is decided afresh, through the same path as a call with no id.
+// The record is re-issued only when it is live and describes THIS call;
+// otherwise it could never be redeemed for it, so a fresh one is minted.
+
+test("a pending id presented for a DIFFERENT call mints a fresh approval instead of re-issuing the old one", async () => {
+  const g = await startGuard("pending-mismatch");
+
+  const first = await g.post("/v1/decide/tool", call());
+  const oldId = first.data.decision.approvalId;
+
+  // What a host keyed on a summary of the call (pre-1.3.3 claudecode) sends:
+  // the same tool, different params, the earlier call's still-pending id.
+  const other = await g.post("/v1/decide/tool", call({ params: { text: "different" }, approval: { approvalId: oldId } }));
+  const d = other.data.decision;
+  assert.equal(d.decision, "approve", "still asks; never a hard deny");
+  assert.ok(d.approvalId && d.approvalId !== oldId, "a fresh record, scoped to this call");
+
+  // The fresh record really is this call's: approving it redeems this call.
+  await g.post("/v1/approvals/resolve", { approvalId: d.approvalId, action: "approve" });
+  const redeemed = await g.post("/v1/decide/tool", call({ params: { text: "different" }, approval: { approvalId: d.approvalId } }));
+  assert.equal(redeemed.data.decision.decision, "allow");
+
+  // And the original record is untouched — still resolvable for its own call.
+  const orig = await g.post("/v1/approvals/resolve", { approvalId: oldId, action: "approve" });
+  assert.equal(orig.data.status, "approved");
+});
+
+test("the re-issued escalation carries the full approval contract (expiresAt + scope)", async () => {
+  const g = await startGuard("pending-contract");
+
+  const first = await g.post("/v1/decide/tool", call());
+  const approvalId = first.data.decision.approvalId;
+  const again = await g.post("/v1/decide/tool", call({ approval: { approvalId } }));
+  const d = again.data.decision;
+  assert.equal(d.approvalId, approvalId);
+  assert.equal(d.expiresAt, first.data.decision.expiresAt, "same record, same expiry");
+  assert.deepEqual(d.scope, first.data.decision.scope);
+});
+
+test("another session's pending id still denies — pending is not a cross-session pass", async () => {
+  const g = await startGuard("pending-session");
+
+  const first = await g.post("/v1/decide/tool", call());
+  const approvalId = first.data.decision.approvalId;
+  const foreign = await g.post("/v1/decide/tool", call({ sessionId: "someone-else", approval: { approvalId } }));
+  assert.equal(foreign.data.decision.decision, "deny");
+  assert.match(String(foreign.data.decision.reason), /session mismatch/i);
+});
+
+// The TTL floor is 30 s (VAIBOT_APPROVAL_TTL_MS), so this test waits it out.
+test("an EXPIRED pending id mints a fresh approval (the old one can no longer be resolved)", { timeout: 60_000 }, async () => {
+  const g = await startGuard("pending-expired", { VAIBOT_APPROVAL_TTL_MS: "30000" });
+
+  const first = await g.post("/v1/decide/tool", call());
+  const oldId = first.data.decision.approvalId;
+  await delay(31_000);
+
+  const again = await g.post("/v1/decide/tool", call({ approval: { approvalId: oldId } }));
+  const d = again.data.decision;
+  assert.equal(d.decision, "approve", "still asks; never a hard deny");
+  assert.ok(d.approvalId && d.approvalId !== oldId, "a live record, not the expired one");
+
+  const old = await g.post("/v1/approvals/resolve", { approvalId: oldId, action: "approve" });
+  // Expired is terminal, so minting the fresh record may already have pruned it.
+  assert.notEqual(old.data.ok, true, "the old record is not resurrected");
+  assert.match(String(old.data.error ?? ""), /expired|not found/i);
+  const fresh = await g.post("/v1/approvals/resolve", { approvalId: d.approvalId, action: "approve" });
+  assert.equal(fresh.data.status, "approved");
 });

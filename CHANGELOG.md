@@ -2,6 +2,28 @@
 
 All notable changes to `@vaibot/guard` are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **A still-pending approval asks again instead of denying.** Re-presenting a call
+  whose approval nobody had answered yet returned a hard deny, `Approval not approved
+  (status=pending)`. The host showed an error instead of a prompt, and the record stayed
+  `pending` forever. That is where the dashboard's orphaned approvals came from.
+
+  A pending id is now not a redemption. The call is decided afresh, through the same path
+  as a call with no id: policy, floor, host bypass, batch, lease, then minting.
+  - If the pending record is still live and is for **this** call (same `paramsHash`),
+    the escalation carries the **same** `approvalId`, `expiresAt` and `scope`, so that
+    record can still be resolved.
+  - If it is for a **different** call (a host that keyed its retry on a summary of the
+    call), a fresh record is minted for this call.
+  - If it has **expired**, it is marked expired and a fresh record is minted.
+  - Another session's pending id still denies (`Approval session mismatch`).
+  - `denied` / `used` / `expired` still deny, and replay protection is unchanged.
+
+  Because policy now runs first, a floor-denied call carrying a pending id reports
+  `floor: true`. Before, it was recorded as an approval-status denial.
+
 ## [2.3.0] — 2026-09-28 — the floor reads git's flags; two new approval tiers
 
 ### Added
