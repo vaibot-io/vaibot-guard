@@ -38,6 +38,7 @@ A local HTTP service that gates agent tool calls and writes a **tamper-evident a
 - `POST /v1/decide/exec`   + `POST /v1/finalize`            — shell exec flows
 - `POST /v1/decide/tool`   + `POST /v1/finalize/tool`       — tool-call gating
 - `POST /v1/approvals/list` + `POST /v1/approvals/resolve`  — approve / deny
+- `POST /v1/approvals/status`                              — the current status of specific approvals
 - `POST /v1/flush`         — checkpoint flush
 - `POST /api/proof`        — Merkle inclusion proofs
 

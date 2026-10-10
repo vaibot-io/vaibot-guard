@@ -4,6 +4,21 @@ All notable changes to `@vaibot/guard` are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`POST /v1/approvals/status`: what specific approvals resolved to.**
+  `/v1/approvals/list` returns **pending** approvals only, so a client that saw an id
+  leave the list couldn't tell "approved, retry it" from "denied" or "lapsed". openclaw's
+  poller assumed approved and auto-retried refusals. The new endpoint takes
+  `{ approvalIds: [...] }` (1–100) and returns each id's effective status: `pending`,
+  `approved`, `denied`, `used`, `expired` (past its TTL while pending or approved, so a
+  redeem would fail) or `unknown`. `unknown` means never issued, or a terminal record
+  since pruned; pruning only drops terminal records, so `unknown` is never a live
+  approval. The endpoint is read-only and needs the guard token. `/health` advertises it
+  as the `approval-status` capability.
+- **Docs:** `references/api.md` now states that an escalation's `approvalId`,
+  `expiresAt` and `scope` are **inside `decision`**, not at the top level of the
+  response.
+
 ### Fixed
 - **A "Yes" in the agent's own dialog spends the approval.** When the host finalizes a
   gated run with `approval: "approved"` (the user approved in its native dialog and the
