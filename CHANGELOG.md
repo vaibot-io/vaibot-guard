@@ -5,6 +5,16 @@ All notable changes to `@vaibot/guard` are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **A "Yes" in the agent's own dialog spends the approval.** When the host finalizes a
+  gated run with `approval: "approved"` (the user approved in its native dialog and the
+  call ran), the run's approval record is now marked `used`. Before, it stayed
+  `pending`: it sat on the dashboard as an open question until its TTL, and could still
+  have been approved there and redeemed by a later call. A record already approved
+  out-of-band is spent the same way. A `denied`, `used` or `expired` record is never
+  changed, so "approved" at finalize cannot turn a refusal into an approval.
+  `approval: "denied"` still burns the record. Both answers now go through one
+  `settleApprovalFromFinalize`, which only ever moves the run's **own** record (from its
+  stored context) to a terminal state.
 - **A still-pending approval asks again instead of denying.** Re-presenting a call
   whose approval nobody had answered yet returned a hard deny, `Approval not approved
   (status=pending)`. The host showed an error instead of a prompt, and the record stayed
