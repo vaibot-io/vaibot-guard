@@ -149,7 +149,11 @@ const INSTANCE_ID = randomUUID();
 //                       than enforce its own default.
 //   rule-id           — escalations and denials carry `decision.ruleId`, the
 //                       policy rule (and subject) that fired.
-const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease", "batch-approval"]);
+//   approval-status   — `POST /v1/approvals/status` reports what specific
+//                       approval ids resolved to (pending / approved / denied /
+//                       used / expired / unknown). Without it, a client can only
+//                       see that an id left the PENDING list — not why.
+const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease", "batch-approval", "approval-status"]);
 
 const VAIBOT_LOG_RETENTION_DAYS = Math.max(1, Number(process.env.VAIBOT_LOG_RETENTION_DAYS || 14));
 
@@ -886,6 +890,26 @@ function listApprovals({ status, sessionId } = {}) {
   out.sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
   return out;
 }
+
+// What an approval id resolves to NOW, for a host that saw it leave the pending
+// list and must tell "approved — retry" apart from "refused / lapsed — don't".
+// Read-only: reports the effective status without mutating the record.
+//   pending | approved — still live
+//   denied | used      — terminal
+//   expired            — past its TTL while pending or approved: a redeem would
+//                        fail, so it is reported as what it effectively is
+//   unknown            — never issued here, or a terminal record since pruned.
+//                        Pruning only ever drops terminal records, so `unknown`
+//                        can never hide a live approval: treat it as not approved.
+function approvalStatus(approvalId) {
+  const rec = readApproval(approvalId);
+  if (!rec) return { approvalId, status: "unknown" };
+  const live = rec.status === "pending" || rec.status === "approved";
+  const status = live && isApprovalExpired(rec) ? "expired" : rec.status;
+  return { approvalId, status, expiresAt: rec.expiresAt, resolvedAt: rec.resolvedAt ?? null, usedAt: rec.usedAt ?? null };
+}
+
+const APPROVAL_STATUS_MAX_IDS = 100;
 
 function createApproval({ sessionId, kind, reason, request, approvalId: approvalIdIn }) {
   pruneApprovals();
@@ -2577,6 +2601,30 @@ const server = http.createServer(async (req, res) => {
       }));
 
       return json(res, 200, { ok: true, approvals });
+    }
+
+    // The terminal answer for specific approvals. `/v1/approvals/list` returns
+    // PENDING only, so an id missing from it may have been approved, denied, used
+    // or expired — a host that read "missing" as "approved" auto-retried refusals.
+    if (req.method === "POST" && req.url === "/v1/approvals/status") {
+      if (!requireAuth(req, res)) return;
+      const raw = await readBody(req);
+      let input;
+      try {
+        input = JSON.parse(raw || "{}");
+      } catch {
+        return json(res, 400, { ok: false, error: "Invalid JSON" });
+      }
+
+      const ids = input?.approvalIds;
+      if (!Array.isArray(ids) || ids.length === 0 || !ids.every((id) => typeof id === "string" && id.length > 0)) {
+        return json(res, 400, { ok: false, error: "approvalIds must be a non-empty array of strings" });
+      }
+      if (ids.length > APPROVAL_STATUS_MAX_IDS) {
+        return json(res, 400, { ok: false, error: `At most ${APPROVAL_STATUS_MAX_IDS} approvalIds per request` });
+      }
+
+      return json(res, 200, { ok: true, approvals: [...new Set(ids)].map(approvalStatus) });
     }
 
     // Creating a batch needs the OPERATOR token, not the guard token: a batch may

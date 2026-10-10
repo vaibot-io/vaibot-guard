@@ -88,12 +88,17 @@ These endpoints are used by the per-host circuit-breaker plugin that intercepts 
 
 ### Approvals (chat-command UX)
 
-When Guard returns `decision=approve`, it also returns an `approvalId` (single-use) and an `expiresAt`.
+When Guard returns `decision=approve`, the `decision` object also carries an `approvalId` (single-use), an `expiresAt` and a `scope` (`{ paramsHash }`) — inside `decision`, not at the top level of the response:
+
+```json
+{ "ok": true, "runId": "run_...", "decision": { "decision": "approve", "reason": "...", "approvalId": "appr_...", "expiresAt": "...", "scope": { "paramsHash": "sha256:..." } } }
+```
 
 To support human-in-the-loop approval:
 
 - `POST /v1/approvals/list` — list **pending** approvals (optionally filtered by `sessionId`)
 - `POST /v1/approvals/resolve` — approve/deny a specific `approvalId`
+- `POST /v1/approvals/status` — the current status of specific `approvalId`s (`list` returns pending only, so an id missing from it is not necessarily approved)
 
 After approval, the caller redeems approval by including:
 
@@ -172,6 +177,35 @@ Response:
 ```json
 { "ok": true, "approvalId": "appr_...", "status": "approved|denied" }
 ```
+
+### `POST /v1/approvals/status`
+
+The current status of specific approvals. Read-only. Use it when an id leaves the
+pending list: `list` returns **pending** approvals only, so a missing id may have been
+approved, denied, used or expired.
+
+Request body (1–100 ids):
+
+```json
+{ "approvalIds": ["appr_...", "appr_..."] }
+```
+
+Response (one entry per distinct id):
+
+```json
+{ "ok": true, "approvals": [ { "approvalId": "appr_...", "status": "approved", "expiresAt": "...", "resolvedAt": "...", "usedAt": null } ] }
+```
+
+| `status` | Meaning |
+|---|---|
+| `pending` | not answered yet |
+| `approved` | approved and still redeemable |
+| `denied` | refused |
+| `used` | already redeemed, or spent by a native "Yes" at finalize |
+| `expired` | past its TTL while pending or approved; a redeem would fail |
+| `unknown` | never issued by this guard, or a terminal record since pruned (pruning only drops `used`/`denied`/`expired`, so `unknown` is never a live approval). Treat it as **not approved**. |
+
+`400` if `approvalIds` is missing, empty, not all non-empty strings, or longer than 100.
 
 ## Ops endpoints
 
