@@ -2828,8 +2828,33 @@ const server = http.createServer(async (req, res) => {
       } catch { /* no paths => no path-scoped lease; never break the decision */ }
 
       const paramsHash = `sha256:${sha256(stableStringify({ toolName, params }))}`;
-      const approvalId = String(input?.approval?.approvalId || "");
+      let approvalId = String(input?.approval?.approvalId || "");
       const hostBypass = parseHostBypass(input.hostBypass);
+
+      // `pending` is the ABSENCE of an answer, not a rejection. Redeeming it used
+      // to deny (`Approval not approved (status=pending)`): the host surfaced a
+      // hard denial instead of a prompt, the question never reached anyone, and
+      // the record stayed pending forever (the dashboard's orphaned approvals).
+      //
+      // So a pending id is not a redemption: the call is decided afresh, through
+      // the same path as a call with no id (policy, floor, bypass, batch, lease,
+      // mint). The pending record is re-issued only when it is still live and
+      // describes THIS call; otherwise it could never be redeemed for it (the
+      // scope check rejects a different paramsHash, and an expired record can no
+      // longer be resolved), so a fresh one is minted. A session mismatch is not
+      // treated as pending: another session's id still denies below.
+      let reuseApprovalId = null;
+      if (approvalId) {
+        const appr = readApproval(approvalId);
+        if (appr?.kind === "tool" && appr.status === "pending" && (!appr.sessionId || appr.sessionId === sessionId)) {
+          if (isApprovalExpired(appr)) {
+            appr.status = "expired"; // lazily, as listApprovals/resolveApproval do
+          } else if (!appr.request?.paramsHash || appr.request.paramsHash === paramsHash) {
+            reuseApprovalId = approvalId;
+          }
+          approvalId = "";
+        }
+      }
 
       let decision;
 
@@ -2843,6 +2868,8 @@ const server = http.createServer(async (req, res) => {
         } else if (appr.sessionId && appr.sessionId !== sessionId) {
           decision = { decision: "deny", reason: "Approval session mismatch" };
         } else if (appr.status !== "approved") {
+          // Terminal states only (pending was handled above): denied / used /
+          // expired are real rejections.
           decision = { decision: "deny", reason: `Approval not approved (status=${appr.status})` };
         } else if (appr.expiresAt && Date.now() > Date.parse(appr.expiresAt)) {
           decision = { decision: "deny", reason: "Approval expired" };
@@ -2884,7 +2911,9 @@ const server = http.createServer(async (req, res) => {
 
         // If policy requires approval, mint an approval record for chat-command resolution.
         if (decision && decision.decision === "approve") {
-          const existingId = decision.approvalId;
+          // The re-issued pending id wins: decideTool stamps every escalation
+          // with a throwaway appr_<uuid>, which would orphan the pending record.
+          const existingId = reuseApprovalId || decision.approvalId;
           const already = existingId ? readApproval(existingId) : null;
           const appr = already
             ? already
