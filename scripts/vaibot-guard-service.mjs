@@ -942,6 +942,28 @@ function markApprovalUsed({ approvalId }) {
   writeApproval(rec);
 }
 
+// The host reports the human's answer to a gated run at finalize. Settle the
+// run's approval record to match, so it can't outlive the answer:
+//   denied   → burn it: a retry must not redeem an approval the user refused.
+//   approved → the user said "Yes" in the host's own dialog and the call RAN,
+//              so the record is spent: mark it `used`. Left `pending`, it sat
+//              on the dashboard as an open question until its TTL, and could
+//              still have been approved there and redeemed by a later call.
+// Only ever moves a record to a terminal state, and only the run's OWN
+// approval (from its stored context), so a finalize can never grant anything.
+function settleApprovalFromFinalize({ ctx, result }) {
+  const approvalId = ctx?.decision?.approvalId;
+  if (!approvalId) return;
+  try {
+    if (result?.approval === "denied") {
+      resolveApproval({ approvalId, action: "deny" });
+    } else if (result?.approval === "approved") {
+      const rec = readApproval(approvalId);
+      if (rec && (rec.status === "pending" || rec.status === "approved")) markApprovalUsed({ approvalId });
+    }
+  } catch { /* already terminal or gone — nothing to settle */ }
+}
+
 // ---- Approval leases --------------------------------------------------------
 //
 // "Allow for this session." A lease suppresses the PROMPT for a scoped, expiring
@@ -3097,13 +3119,9 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // A rejected gate is terminal: burn the local approval record so a retry
-      // of the same intent cannot redeem an approval the user just refused.
-      // Best-effort — an already-expired/used record simply has nothing to do.
-      if (result?.approval === "denied" && ctx1?.decision?.approvalId) {
-        try { resolveApproval({ approvalId: ctx1.decision.approvalId, action: "deny" }); }
-        catch { /* already resolved or expired */ }
-      }
+      // The human's answer settles the run's approval record (burned on "No",
+      // spent on "Yes") — see settleApprovalFromFinalize.
+      settleApprovalFromFinalize({ ctx: ctx1, result });
 
       // M: a tier-2 governance receipt is earned, not automatic. Only egress/network
       // or high/dangerous calls get a signed receipt; ledger-tier calls are already
