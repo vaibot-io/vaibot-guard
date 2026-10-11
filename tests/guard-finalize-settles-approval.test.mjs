@@ -65,7 +65,7 @@ async function startGuard(label) {
     return { status: res.status, data: await res.json().catch(() => ({})) };
   }
   const pendingIds = async () => (await post("/v1/approvals/list", {})).data.approvals.map((a) => a.approvalId);
-  return { post, pendingIds };
+  return { post, pendingIds, healthUrl: `http://127.0.0.1:${port}/health` };
 }
 
 // message.send lands in the ask lane under the default policy.
@@ -172,4 +172,12 @@ test("tool: an expired answer marks the record expired at once — off the queue
   assert.equal(status.data.approvals?.[0]?.status ?? status.data.statuses?.[0]?.status, "expired");
   const late = await g.post("/v1/approvals/resolve", { approvalId, action: "approve" });
   assert.match(String(late.data.error), /status 'expired'/);
+});
+
+test("/health advertises approval-resolutions, so a breaker sends host_denied/expired only to a guard that understands them", async () => {
+  // An older guard reads any gated finalize without approval:"denied" as
+  // "Approved — action ran", so a breaker must check before it sends these.
+  const g = await startGuard("caps");
+  const health = await (await fetch(g.healthUrl)).json();
+  assert.ok(health.capabilities.includes("approval-resolutions"));
 });

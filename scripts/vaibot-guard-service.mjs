@@ -154,7 +154,7 @@ const INSTANCE_ID = randomUUID();
 //                       approval ids resolved to (pending / approved / denied /
 //                       used / expired / unknown). Without it, a client can only
 //                       see that an id left the PENDING list — not why.
-const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease", "batch-approval", "approval-status"]);
+const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease", "batch-approval", "approval-status", "approval-resolutions"]);
 
 const VAIBOT_LOG_RETENTION_DAYS = Math.max(1, Number(process.env.VAIBOT_LOG_RETENTION_DAYS || 14));
 

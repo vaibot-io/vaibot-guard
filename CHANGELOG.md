@@ -23,7 +23,8 @@ All notable changes to `@vaibot/guard` are documented here.
   recorded as `denied` + `blocked`, because the server has no status of its own for them.
   It burns the approval record (`host_denied`) or marks it `expired` at once, so it
   leaves the dashboard queue and can't be approved afterwards. A bypass can't recast
-  either as "ran".
+  either as "ran". `/health` advertises it as the `approval-resolutions` capability; an
+  older guard would read either one as "approved — ran", so breakers check for it first.
 - **`POST /v1/approvals/status`: what specific approvals resolved to.**
   `/v1/approvals/list` returns **pending** approvals only, so a client that saw an id
   leave the list couldn't tell "approved, retry it" from "denied" or "lapsed". openclaw's
