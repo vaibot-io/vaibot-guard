@@ -151,3 +151,25 @@ test("tool: settling touches only the run's OWN approval", async () => {
   assert.ok(!pending.includes(a.approvalId));
   assert.ok(pending.includes(b.approvalId), "another run's approval is untouched");
 });
+
+test("tool: a host's refusal burns the approval, like a user's", async () => {
+  const g = await startGuard("host-denied");
+  const { runId, approvalId } = await gatedToolRun(g);
+
+  await g.post("/v1/finalize/tool", { sessionId: "settle", runId, result: { ok: false, approval: "host_denied", host: "cursor" } });
+  assert.ok(!(await g.pendingIds()).includes(approvalId));
+  const redeem = await g.post("/v1/decide/tool", call({ approval: { approvalId } }));
+  assert.match(String(redeem.data.decision.reason), /status=denied/);
+});
+
+test("tool: an expired answer marks the record expired at once — off the queue, not approvable", async () => {
+  const g = await startGuard("expired");
+  const { runId, approvalId } = await gatedToolRun(g);
+
+  await g.post("/v1/finalize/tool", { sessionId: "settle", runId, result: { ok: false, approval: "expired" } });
+  assert.ok(!(await g.pendingIds()).includes(approvalId), "no longer an open question on the dashboard");
+  const status = await g.post("/v1/approvals/status", { approvalIds: [approvalId] });
+  assert.equal(status.data.approvals?.[0]?.status ?? status.data.statuses?.[0]?.status, "expired");
+  const late = await g.post("/v1/approvals/resolve", { approvalId, action: "approve" });
+  assert.match(String(late.data.error), /status 'expired'/);
+});

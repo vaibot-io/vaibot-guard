@@ -173,10 +173,33 @@ test("actionVerbFor reads from the outcome, not the verdict", () => {
   const verb = (approvalStatus, observeMode = false) =>
     actionVerbFor({ mappedDecision: "approval_required", approvalStatus, observeMode });
   assert.equal(verb("approved"), "executed after approval");
-  assert.equal(verb("denied"), "was denied approval to run");
+  assert.equal(verb("denied"), "was declined and did not run");
   assert.equal(verb("bypassed"), "executed under an approval bypass");
   assert.equal(verb("pending"), "paused pending approval for");
   assert.equal(verb("not_required", true), "would have paused pending approval for");
   assert.equal(actionVerbFor({ mappedDecision: "deny", approvalStatus: "not_required", observeMode: false }), "blocked from executing");
   assert.equal(actionVerbFor({ mappedDecision: "allow", approvalStatus: "not_required", observeMode: false }), "executed");
+});
+
+// ── how a gate was settled: one vocabulary for every breaker ─────────────────
+
+test("host_denied and expired: did not run, not approved, and never a reviewer's denial", () => {
+  for (const approval of ["host_denied", "expired"]) {
+    assert.deepEqual(enforce("approve", { approval, ok: false }), {
+      outcome: "blocked", approvalStatus: "denied", observeMode: false, resolved: false,
+    }, approval);
+    // A bypass is "it ran with nobody asked" — it cannot recast a refusal.
+    assert.equal(enforce("approve", { approval }, true).approvalStatus, "denied", `${approval} under bypass`);
+  }
+  // A person's "No" is still the only denied_by_reviewer.
+  assert.equal(enforce("approve", { approval: "denied" }).outcome, "denied_by_reviewer");
+});
+
+test("the verb names who declined it", () => {
+  const verb = (resolution, host) =>
+    actionVerbFor({ mappedDecision: "approval_required", approvalStatus: "denied", observeMode: false, resolution, host });
+  assert.equal(verb("user_declined"), "was declined by the user and did not run");
+  assert.equal(verb("host_declined", "cursor"), "was declined by Cursor and did not run");
+  assert.equal(verb("host_declined", "not-a-host"), "was declined by the host and did not run");
+  assert.equal(verb("expired"), "got no answer before its approval expired and did not run");
 });

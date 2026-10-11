@@ -7,6 +7,23 @@ All notable changes to `@vaibot/guard` are documented here.
 ## [2.4.0] — 2026-10-11 — approvals that settle: pending re-asks, a "Yes" spends, status you can query
 
 ### Added
+- **One way to say how an approval was settled, for every breaker.** `result.approval`
+  at finalize now has a closed vocabulary shared by all five hosts:
+  - `approved`;
+  - `denied`: a **person** declined, only when the host can prove it;
+  - `host_denied`: the host refused it, and it isn't known to be the user's answer;
+  - `expired`: nobody answered.
+
+  An optional `result.host` makes a host refusal read "Declined by Cursor" rather than
+  "by the host". Each answer has one receipt wording, in `scripts/lib/approval-resolution.mjs`:
+  "Approved — action ran.", "Declined by the user — action did not run.", "Declined by
+  Cursor, not by the user — action did not run." and "Approval expired with no answer —
+  action did not run.". These replace "Approved/Denied in the agent session".
+  `denied_by_reviewer` stays reserved for a person's "No". A host refusal or an expiry is
+  recorded as `denied` + `blocked`, because the server has no status of its own for them.
+  It burns the approval record (`host_denied`) or marks it `expired` at once, so it
+  leaves the dashboard queue and can't be approved afterwards. A bypass can't recast
+  either as "ran".
 - **`POST /v1/approvals/status`: what specific approvals resolved to.**
   `/v1/approvals/list` returns **pending** approvals only, so a client that saw an id
   leave the list couldn't tell "approved, retry it" from "denied" or "lapsed". openclaw's
