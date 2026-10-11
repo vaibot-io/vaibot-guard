@@ -1,6 +1,10 @@
-// approval-resolution — how a gated run was settled, in ONE vocabulary shared by
-// every breaker, so the same answer reads the same on every receipt whichever
-// host it came from.
+// approval-resolution — how a gated run was settled, as reported by a breaker
+// at finalize.
+//
+// The wording of the EXISTING answers (approved, a person's denial, a bypass) is
+// unchanged, byte for byte: receipts are reported on, and those strings are
+// part of what consumers rely on. Only the two additive answers below get new
+// wording, which by construction appears on no receipt that existed before.
 //
 // A breaker reports the answer at finalize as `result.approval`:
 //
@@ -48,12 +52,12 @@ export function approvalResolution(result) {
   return null;
 }
 
-/** The one wording per resolution, used for every receipt's result summary. */
+/** The receipt's result summary for a gated run (followed by the policy reason). */
 export function resolutionSummary({ resolution, host, bypassed = false }) {
   const by = hostLabel(host) ?? "the host";
   switch (resolution) {
     case "user_declined":
-      return "Declined by the user — action did not run.";
+      return "Denied in the agent session — action did not run.";
     case "host_declined":
       return `Declined by ${by}, not by the user — action did not run.`;
     case "expired":
@@ -61,16 +65,17 @@ export function resolutionSummary({ resolution, host, bypassed = false }) {
     default:
       return bypassed
         ? "Approval bypass honoured by policy — action ran without a human decision."
-        : "Approved — action ran.";
+        : "Approved in the agent session — action ran.";
   }
 }
 
-/** The matching verb for the receipt's action summary ("Agent <verb>: <command>"). */
+/**
+ * The verb for the receipt's action summary ("Agent <verb>: <command>") for the
+ * two additive answers. null for every existing answer, whose verb is unchanged.
+ */
 export function resolutionVerb({ resolution, host }) {
   const by = hostLabel(host) ?? "the host";
   switch (resolution) {
-    case "user_declined":
-      return "was declined by the user and did not run";
     case "host_declined":
       return `was declined by ${by} and did not run`;
     case "expired":

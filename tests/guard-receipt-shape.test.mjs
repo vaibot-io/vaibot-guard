@@ -173,7 +173,7 @@ test("actionVerbFor reads from the outcome, not the verdict", () => {
   const verb = (approvalStatus, observeMode = false) =>
     actionVerbFor({ mappedDecision: "approval_required", approvalStatus, observeMode });
   assert.equal(verb("approved"), "executed after approval");
-  assert.equal(verb("denied"), "was declined and did not run");
+  assert.equal(verb("denied"), "was denied approval to run");
   assert.equal(verb("bypassed"), "executed under an approval bypass");
   assert.equal(verb("pending"), "paused pending approval for");
   assert.equal(verb("not_required", true), "would have paused pending approval for");
@@ -198,7 +198,7 @@ test("host_denied and expired: did not run, not approved, and never a reviewer's
 test("the verb names who declined it", () => {
   const verb = (resolution, host) =>
     actionVerbFor({ mappedDecision: "approval_required", approvalStatus: "denied", observeMode: false, resolution, host });
-  assert.equal(verb("user_declined"), "was declined by the user and did not run");
+  assert.equal(verb("user_declined"), "was denied approval to run", "an existing answer keeps its existing verb");
   assert.equal(verb("host_declined", "cursor"), "was declined by Cursor and did not run");
   assert.equal(verb("host_declined", "not-a-host"), "was declined by the host and did not run");
   assert.equal(verb("expired"), "got no answer before its approval expired and did not run");

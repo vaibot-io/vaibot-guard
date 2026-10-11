@@ -147,7 +147,7 @@ test("an approved gate is recorded approved + allowed, not left pending", async 
   assert.equal(r.result.outcome, "allowed");
   assert.equal(r.observe_mode, false);
   assert.match(r.action.summary, /executed after approval/);
-  assert.match(r.result.summary, /^Approved — action ran\./);
+  assert.match(r.result.summary, /^Approved in the agent session — action ran\. /);
 });
 
 test("a denied gate is recorded denied + denied_by_reviewer", async () => {
@@ -166,8 +166,9 @@ test("a denied gate is recorded denied + denied_by_reviewer", async () => {
   const r = captured[0];
   assert.equal(r.approval.status, "denied");
   assert.equal(r.result.outcome, "denied_by_reviewer");
-  assert.match(r.action.summary, /was declined by the user and did not run/);
-  assert.match(r.result.summary, /^Declined by the user — action did not run\./);
+  assert.match(r.action.summary, /denied approval/);
+  // Existing wording is unchanged, byte for byte: consumers report on it.
+  assert.match(r.result.summary, /^Denied in the agent session — action did not run\. /);
 });
 
 test("an approved-but-failed action reports blocked, not allowed", async () => {

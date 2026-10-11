@@ -130,7 +130,7 @@ export function actionVerbFor({ mappedDecision, approvalStatus, observeMode, res
   if (observeMode) return "would have paused pending approval for";
   const settled = resolutionVerb({ resolution, host });
   if (settled) return settled;
-  if (approvalStatus === "denied") return "was declined and did not run";
+  if (approvalStatus === "denied") return "was denied approval to run";
   if (approvalStatus === "bypassed") return "executed under an approval bypass";
   if (approvalStatus === "pending") return "paused pending approval for";
   return "executed after approval";
