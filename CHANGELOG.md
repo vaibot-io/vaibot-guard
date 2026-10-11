@@ -4,6 +4,8 @@ All notable changes to `@vaibot/guard` are documented here.
 
 ## [Unreleased]
 
+## [2.4.0] — 2026-10-11 — approvals that settle: pending re-asks, a "Yes" spends, status you can query
+
 ### Added
 - **`POST /v1/approvals/status`: what specific approvals resolved to.**
   `/v1/approvals/list` returns **pending** approvals only, so a client that saw an id
