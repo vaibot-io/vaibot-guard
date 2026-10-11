@@ -207,7 +207,7 @@ test.after(async () => {
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-test("a host's refusal reads 'Declined by <host>', never as the user's", async () => {
+test("a host's refusal reads as automatic, never as the user's, and never names the host", async () => {
   const { captured, post, gate } = await startGuard({ mode: "enforce", label: "host-denied" });
   const decided = await gate("sess-host-deny");
 
@@ -221,8 +221,9 @@ test("a host's refusal reads 'Declined by <host>', never as the user's", async (
   const r = captured[0];
   assert.equal(r.approval.status, "denied");
   assert.equal(r.result.outcome, "blocked", "not denied_by_reviewer: no person is known to have said no");
-  assert.match(r.result.summary, /^Declined by Cursor, not by the user — action did not run\./);
-  assert.match(r.action.summary, /was declined by Cursor and did not run/);
+  assert.match(r.result.summary, /^Declined automatically in the agent session, not by the user — action did not run\./);
+  assert.match(r.action.summary, /was declined automatically in the agent session and did not run/);
+  assert.doesNotMatch(JSON.stringify(r), /Cursor/, "a host passing result.host is not named either");
 });
 
 test("an approval nobody answered reads 'expired'", async () => {

@@ -122,13 +122,12 @@ export function receiptOutcome({ guardDecision, effectiveMode, result, bypassOve
  * @param {string} a.approvalStatus  from receiptOutcome()
  * @param {boolean} a.observeMode
  * @param {string|null} [a.resolution]  approvalResolution(result)
- * @param {string|null} [a.host]  result.host, for "declined by <host>"
  */
-export function actionVerbFor({ mappedDecision, approvalStatus, observeMode, resolution = null, host = null }) {
+export function actionVerbFor({ mappedDecision, approvalStatus, observeMode, resolution = null }) {
   if (mappedDecision === "deny") return "blocked from executing";
   if (mappedDecision !== "approval_required") return "executed";
   if (observeMode) return "would have paused pending approval for";
-  const settled = resolutionVerb({ resolution, host });
+  const settled = resolutionVerb({ resolution });
   if (settled) return settled;
   if (approvalStatus === "denied") return "was denied approval to run";
   if (approvalStatus === "bypassed") return "executed under an approval bypass";

@@ -2036,7 +2036,6 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // How the gate was settled — one vocabulary for every breaker
   // (lib/approval-resolution.mjs). null = the call ran.
   const resolution = approvalResolution(result);
-  const reportingHost = typeof result?.host === "string" ? result.host : null;
   const bypassed = decision?.bypassOverride === true && resolution === null;
 
   // One pure function owns the (verdict x mode x what-came-back) mapping, so
@@ -2074,14 +2073,14 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   const agentId = String(sessionId || "unknown-session");
   const policyReason = String(decision?.reason || risk?.reason || "Policy decision");
   const actionVerb = actionVerbFor({
-    mappedDecision, approvalStatus, observeMode: shape.observeMode, resolution, host: reportingHost,
+    mappedDecision, approvalStatus, observeMode: shape.observeMode, resolution,
   });
 
   // The gate is resolved by the time this receipt is written, so say what
   // happened rather than restating the reason it was gated.
   const resultSummary =
     mappedDecision === "approval_required" && !observing
-      ? `${resolutionSummary({ resolution, host: reportingHost, bypassed })} ${policyReason}`
+      ? `${resolutionSummary({ resolution, bypassed })} ${policyReason}`
       : policyReason;
 
   const receiptPayload = {

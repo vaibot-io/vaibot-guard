@@ -12,9 +12,8 @@ All notable changes to `@vaibot/guard` are documented here.
   session — action ran". So a breaker couldn't honestly report a refusal it can't
   attribute to the user (e.g. Cursor's `permission_denied`, which another hook's deny
   produces too), or an ask nobody answered. `result.approval` now also takes:
-  - `host_denied`: receipt "Declined by <host>, not by the user — action did not run.",
-    with an optional `result.host` of `claudecode` / `codex` / `cursor` / `openclaw` /
-    `hermes`;
+  - `host_denied`: receipt "Declined automatically in the agent session, not by the user — action did not run." The
+    receipt never names the agent harness;
   - `expired`: "Approval expired with no answer — action did not run.".
 
   Both are recorded as `denied` + `blocked`. `denied_by_reviewer` stays reserved for a

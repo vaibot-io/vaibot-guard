@@ -195,11 +195,10 @@ test("host_denied and expired: did not run, not approved, and never a reviewer's
   assert.equal(enforce("approve", { approval: "denied" }).outcome, "denied_by_reviewer");
 });
 
-test("the verb names who declined it", () => {
-  const verb = (resolution, host) =>
-    actionVerbFor({ mappedDecision: "approval_required", approvalStatus: "denied", observeMode: false, resolution, host });
+test("the verb says how it was settled, without naming the host", () => {
+  const verb = (resolution) =>
+    actionVerbFor({ mappedDecision: "approval_required", approvalStatus: "denied", observeMode: false, resolution });
   assert.equal(verb("user_declined"), "was denied approval to run", "an existing answer keeps its existing verb");
-  assert.equal(verb("host_declined", "cursor"), "was declined by Cursor and did not run");
-  assert.equal(verb("host_declined", "not-a-host"), "was declined by the host and did not run");
+  assert.equal(verb("host_declined"), "was declined automatically in the agent session and did not run");
   assert.equal(verb("expired"), "got no answer before its approval expired and did not run");
 });

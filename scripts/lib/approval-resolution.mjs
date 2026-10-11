@@ -17,8 +17,8 @@
 //                  prompt the host withdrew). Never attributed to a person.
 //   "expired"      nobody answered before the approval lapsed.
 //
-// and may name itself as `result.host` (a closed vocabulary below) so a
-// host-side refusal reads "Declined by Cursor" rather than "by the host".
+// The receipt never names the host: a refusal reads the same whichever agent
+// harness produced it.
 //
 // The server's receipt schema has no status for the last two, so both are
 // recorded as approval.status "denied" + outcome "blocked" (it did not run, and
@@ -26,19 +26,6 @@
 // `denied_by_reviewer`: that outcome is reserved for a person's "No".
 //
 // Pure and dependency-free.
-
-export const HOST_LABELS = Object.freeze({
-  claudecode: "Claude Code",
-  codex: "Codex",
-  cursor: "Cursor",
-  openclaw: "OpenClaw",
-  hermes: "Hermes",
-});
-
-/** The display name of a breaker's host, or null for anything unrecognised. */
-export function hostLabel(host) {
-  return Object.hasOwn(HOST_LABELS, host) ? HOST_LABELS[host] : null;
-}
 
 /**
  * How a gated run was settled, from what the host reported at finalize.
@@ -53,13 +40,12 @@ export function approvalResolution(result) {
 }
 
 /** The receipt's result summary for a gated run (followed by the policy reason). */
-export function resolutionSummary({ resolution, host, bypassed = false }) {
-  const by = hostLabel(host) ?? "the host";
+export function resolutionSummary({ resolution, bypassed = false }) {
   switch (resolution) {
     case "user_declined":
       return "Denied in the agent session — action did not run.";
     case "host_declined":
-      return `Declined by ${by}, not by the user — action did not run.`;
+      return "Declined automatically in the agent session, not by the user — action did not run.";
     case "expired":
       return "Approval expired with no answer — action did not run.";
     default:
@@ -73,11 +59,10 @@ export function resolutionSummary({ resolution, host, bypassed = false }) {
  * The verb for the receipt's action summary ("Agent <verb>: <command>") for the
  * two additive answers. null for every existing answer, whose verb is unchanged.
  */
-export function resolutionVerb({ resolution, host }) {
-  const by = hostLabel(host) ?? "the host";
+export function resolutionVerb({ resolution }) {
   switch (resolution) {
     case "host_declined":
-      return `was declined by ${by} and did not run`;
+      return "was declined automatically in the agent session and did not run";
     case "expired":
       return "got no answer before its approval expired and did not run";
     default:

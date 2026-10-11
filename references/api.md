@@ -156,10 +156,10 @@ Response:
 |---|---|---|---|
 | `"approved"` (or absent) | the call ran after approval | `approved` / `allowed` (or `blocked` if it failed) — "Approved in the agent session — action ran." | `used` |
 | `"denied"` | a **person** declined it in the host's prompt — only when the host proves it | `denied` / `denied_by_reviewer` — "Denied in the agent session — action did not run." | `denied` |
-| `"host_denied"` | the host refused it, not known to be the user's answer | `denied` / `blocked` — "Declined by <host>, not by the user — action did not run." | `denied` |
+| `"host_denied"` | the host refused it, not known to be the user's answer | `denied` / `blocked` — "Declined automatically in the agent session, not by the user — action did not run." | `denied` |
 | `"expired"` | nobody answered before the approval lapsed | `denied` / `blocked` — "Approval expired with no answer — action did not run." | `expired` |
 
-`result.host` (optional) names the reporting host for the "Declined by <host>" wording: `claudecode`, `codex`, `cursor`, `openclaw` or `hermes`. Anything else reads "the host". Only `"denied"` ever produces `denied_by_reviewer`. `/health` advertises this as the `approval-resolutions` capability. A guard without it reads **any** gated finalize that lacks `approval: "denied"` as "approved — ran", so a breaker must check the capability before it sends `host_denied` or `expired`.
+The wording never names the agent harness. Only `"denied"` ever produces `denied_by_reviewer`. `/health` advertises this as the `approval-resolutions` capability. A guard without it reads **any** gated finalize that lacks `approval: "denied"` as "approved — ran", so a breaker must check the capability before it sends `host_denied` or `expired`.
 
 ### `POST /v1/approvals/list`
 
