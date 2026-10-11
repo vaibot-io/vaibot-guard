@@ -17,6 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { classify, toolKind } from "./classifier.mjs";
 import { receiptOutcome, actionVerbFor } from "./lib/receipt-shape.mjs";
+import { approvalResolution, resolutionSummary } from "./lib/approval-resolution.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE, readContainment, writeContainment } from "./lib/guard-bootstrap.mjs";
@@ -153,7 +154,7 @@ const INSTANCE_ID = randomUUID();
 //                       approval ids resolved to (pending / approved / denied /
 //                       used / expired / unknown). Without it, a client can only
 //                       see that an id left the PENDING list — not why.
-const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease", "batch-approval", "approval-status"]);
+const GUARD_CAPABILITIES = Object.freeze(["host-vocab:hermes", "host-bypass", "rule-id", "approval-lease", "batch-approval", "approval-status", "approval-resolutions"]);
 
 const VAIBOT_LOG_RETENTION_DAYS = Math.max(1, Number(process.env.VAIBOT_LOG_RETENTION_DAYS || 14));
 
@@ -979,8 +980,19 @@ function settleApprovalFromFinalize({ ctx, result }) {
   const approvalId = ctx?.decision?.approvalId;
   if (!approvalId) return;
   try {
-    if (result?.approval === "denied") {
+    if (result?.approval === "denied" || result?.approval === "host_denied") {
+      // Refused — by the user or by the host. Either way the call did not run,
+      // and a retry must not redeem the record.
       resolveApproval({ approvalId, action: "deny" });
+    } else if (result?.approval === "expired") {
+      // Nobody answered. Mark it expired now rather than leave it pending (and
+      // approvable on the dashboard) until its TTL.
+      const rec = readApproval(approvalId);
+      if (rec && (rec.status === "pending" || rec.status === "approved")) {
+        rec.status = "expired";
+        rec.resolvedAt = nowIso();
+        writeApproval(rec);
+      }
     } else if (result?.approval === "approved") {
       const rec = readApproval(approvalId);
       if (rec && (rec.status === "pending" || rec.status === "approved")) markApprovalUsed({ approvalId });
@@ -2021,9 +2033,10 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // of the pending queue, so keep the uniform "pending" and flag the mode
   // instead of inventing a human decision that never happened.
   const observing = normalizeMode(effectiveMode || EFFECTIVE_MODE) === "observe";
-  const humanDenied =
-    result?.approval === "denied" || result?.outcome === "denied_by_reviewer";
-  const bypassed = decision?.bypassOverride === true && !humanDenied;
+  // How the gate was settled — one vocabulary for every breaker
+  // (lib/approval-resolution.mjs). null = the call ran.
+  const resolution = approvalResolution(result);
+  const bypassed = decision?.bypassOverride === true && resolution === null;
 
   // One pure function owns the (verdict x mode x what-came-back) mapping, so
   // "pending" is emitted only for a gate that is genuinely still outstanding.
@@ -2059,17 +2072,15 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
 
   const agentId = String(sessionId || "unknown-session");
   const policyReason = String(decision?.reason || risk?.reason || "Policy decision");
-  const actionVerb = actionVerbFor({ mappedDecision, approvalStatus, observeMode: shape.observeMode });
+  const actionVerb = actionVerbFor({
+    mappedDecision, approvalStatus, observeMode: shape.observeMode, resolution,
+  });
 
   // The gate is resolved by the time this receipt is written, so say what
   // happened rather than restating the reason it was gated.
   const resultSummary =
     mappedDecision === "approval_required" && !observing
-      ? humanDenied
-        ? `Denied in the agent session — action did not run. ${policyReason}`
-        : bypassed
-          ? `Approval bypass honoured by policy — action ran without a human decision. ${policyReason}`
-          : `Approved in the agent session — action ran. ${policyReason}`
+      ? `${resolutionSummary({ resolution, bypassed })} ${policyReason}`
       : policyReason;
 
   const receiptPayload = {

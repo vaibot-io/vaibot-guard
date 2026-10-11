@@ -32,7 +32,9 @@
 // status that cannot be mistaken for an outstanding decision is excluded by
 // construction instead.
 //
-// Pure and dependency-free, so it unit-tests without booting the daemon.
+// Pure, so it unit-tests without booting the daemon.
+
+import { approvalResolution, resolutionVerb } from "./approval-resolution.mjs";
 
 /**
  * @param {object} a
@@ -57,8 +59,11 @@ export function receiptOutcome({ guardDecision, effectiveMode, result, bypassOve
   // Did anything come back? A result exists only once the run completed, which
   // is also the moment a human's answer can reach us.
   const answered = result != null;
-  const humanDenied = result?.approval === "denied" || result?.outcome === "denied_by_reviewer";
-  const bypassed = bypassOverride === true && !humanDenied;
+  // How the gate was settled, in the vocabulary shared by every breaker
+  // (approval-resolution.mjs). null = the call ran.
+  const resolution = approvalResolution(result);
+  const humanDenied = resolution === "user_declined";
+  const bypassed = bypassOverride === true && resolution === null;
 
   // A FLOOR deny is the exception to everything below: Tier-0 containment and
   // the catastrophic floor hold even in observe, which is what "floor" means.
@@ -86,6 +91,13 @@ export function receiptOutcome({ guardDecision, effectiveMode, result, bypassOve
     if (humanDenied) {
       return { outcome: "denied_by_reviewer", approvalStatus: "denied", observeMode, resolved: true };
     }
+    // Refused by the host, or lapsed with no answer: it did not run and was not
+    // approved, but no PERSON is known to have said no — so never
+    // denied_by_reviewer, and not a resolved human gate. The server has no
+    // status of its own for these; the receipt summary names which it was.
+    if (resolution === "host_declined" || resolution === "expired") {
+      return { outcome: "blocked", approvalStatus: "denied", observeMode, resolved: false };
+    }
     if (bypassed) {
       // Policy granted the escalation; no human decided, so this is not a
       // resolved gate even though it is terminal.
@@ -109,11 +121,14 @@ export function receiptOutcome({ guardDecision, effectiveMode, result, bypassOve
  * @param {"allow"|"approval_required"|"deny"|string} a.mappedDecision
  * @param {string} a.approvalStatus  from receiptOutcome()
  * @param {boolean} a.observeMode
+ * @param {string|null} [a.resolution]  approvalResolution(result)
  */
-export function actionVerbFor({ mappedDecision, approvalStatus, observeMode }) {
+export function actionVerbFor({ mappedDecision, approvalStatus, observeMode, resolution = null }) {
   if (mappedDecision === "deny") return "blocked from executing";
   if (mappedDecision !== "approval_required") return "executed";
   if (observeMode) return "would have paused pending approval for";
+  const settled = resolutionVerb({ resolution });
+  if (settled) return settled;
   if (approvalStatus === "denied") return "was denied approval to run";
   if (approvalStatus === "bypassed") return "executed under an approval bypass";
   if (approvalStatus === "pending") return "paused pending approval for";

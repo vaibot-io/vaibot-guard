@@ -180,3 +180,31 @@ test("actionVerbFor reads from the outcome, not the verdict", () => {
   assert.equal(actionVerbFor({ mappedDecision: "deny", approvalStatus: "not_required", observeMode: false }), "blocked from executing");
   assert.equal(actionVerbFor({ mappedDecision: "allow", approvalStatus: "not_required", observeMode: false }), "executed");
 });
+
+// ── how a gate was settled: one vocabulary for every breaker ─────────────────
+
+test("host_denied and expired: did not run, not approved, and never a reviewer's denial", () => {
+  for (const approval of ["host_denied", "expired"]) {
+    assert.deepEqual(enforce("approve", { approval, ok: false }), {
+      outcome: "blocked", approvalStatus: "denied", observeMode: false, resolved: false,
+    }, approval);
+    // A bypass is "it ran with nobody asked" — it cannot recast a refusal.
+    assert.equal(enforce("approve", { approval }, true).approvalStatus, "denied", `${approval} under bypass`);
+  }
+  // A person's "No" is still the only denied_by_reviewer.
+  assert.equal(enforce("approve", { approval: "denied" }).outcome, "denied_by_reviewer");
+});
+
+test("the verb says how it was settled, without naming the host", () => {
+  const verb = (resolution) =>
+    actionVerbFor({ mappedDecision: "approval_required", approvalStatus: "denied", observeMode: false, resolution });
+  assert.equal(verb("user_declined"), "was denied approval to run", "an existing answer keeps its existing verb");
+  assert.equal(verb("host_declined"), "was declined automatically");
+  assert.equal(verb("expired"), "was not approved in time");
+  // The email subject keeps 60 chars of "Agent <verb>: <command>". No new verb
+  // may leave less of the command than the existing denial does.
+  const budget = "Agent was denied approval to run: ".length;
+  for (const r of ["host_declined", "expired"]) {
+    assert.ok(`Agent ${verb(r)}: `.length <= budget, `${r} verb crowds the command out of the email subject`);
+  }
+});

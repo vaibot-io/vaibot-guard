@@ -147,6 +147,7 @@ test("an approved gate is recorded approved + allowed, not left pending", async 
   assert.equal(r.result.outcome, "allowed");
   assert.equal(r.observe_mode, false);
   assert.match(r.action.summary, /executed after approval/);
+  assert.match(r.result.summary, /^Approved in the agent session — action ran\. /);
 });
 
 test("a denied gate is recorded denied + denied_by_reviewer", async () => {
@@ -166,6 +167,8 @@ test("a denied gate is recorded denied + denied_by_reviewer", async () => {
   assert.equal(r.approval.status, "denied");
   assert.equal(r.result.outcome, "denied_by_reviewer");
   assert.match(r.action.summary, /denied approval/);
+  // Existing wording is unchanged, byte for byte: consumers report on it.
+  assert.match(r.result.summary, /^Denied in the agent session — action did not run\. /);
 });
 
 test("an approved-but-failed action reports blocked, not allowed", async () => {
@@ -202,4 +205,36 @@ test.after(async () => {
   for (const s of httpServers) { try { s.close(); } catch { /* best effort */ } }
   await delay(100);
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+test("a host's refusal reads as automatic, never as the user's, and never names the host", async () => {
+  const { captured, post, gate } = await startGuard({ mode: "enforce", label: "host-denied" });
+  const decided = await gate("sess-host-deny");
+
+  await post("/v1/finalize/tool", {
+    sessionId: "sess-host-deny",
+    runId: decided.runId,
+    result: { ok: false, approval: "host_denied", host: "cursor" },
+  });
+
+  assert.equal(await waitUntil(() => captured.length > 0), true);
+  const r = captured[0];
+  assert.equal(r.approval.status, "denied");
+  assert.equal(r.result.outcome, "blocked", "not denied_by_reviewer: no person is known to have said no");
+  assert.match(r.result.summary, /^Declined automatically in the agent session, not by the user — action did not run\./);
+  assert.match(r.action.summary, /^Agent was declined automatically: /);
+  assert.doesNotMatch(JSON.stringify(r), /Cursor/, "a host passing result.host is not named either");
+});
+
+test("an approval nobody answered reads 'expired'", async () => {
+  const { captured, post, gate } = await startGuard({ mode: "enforce", label: "expired" });
+  const decided = await gate("sess-expired");
+
+  await post("/v1/finalize/tool", { sessionId: "sess-expired", runId: decided.runId, result: { ok: false, approval: "expired" } });
+
+  assert.equal(await waitUntil(() => captured.length > 0), true);
+  const r = captured[0];
+  assert.equal(r.result.outcome, "blocked");
+  assert.match(r.result.summary, /^Approval expired with no answer — action did not run\./);
+  assert.match(r.action.summary, /^Agent was not approved in time: /);
 });

@@ -65,7 +65,7 @@ async function startGuard(label) {
     return { status: res.status, data: await res.json().catch(() => ({})) };
   }
   const pendingIds = async () => (await post("/v1/approvals/list", {})).data.approvals.map((a) => a.approvalId);
-  return { post, pendingIds };
+  return { post, pendingIds, healthUrl: `http://127.0.0.1:${port}/health` };
 }
 
 // message.send lands in the ask lane under the default policy.
@@ -150,4 +150,34 @@ test("tool: settling touches only the run's OWN approval", async () => {
   const pending = await g.pendingIds();
   assert.ok(!pending.includes(a.approvalId));
   assert.ok(pending.includes(b.approvalId), "another run's approval is untouched");
+});
+
+test("tool: a host's refusal burns the approval, like a user's", async () => {
+  const g = await startGuard("host-denied");
+  const { runId, approvalId } = await gatedToolRun(g);
+
+  await g.post("/v1/finalize/tool", { sessionId: "settle", runId, result: { ok: false, approval: "host_denied", host: "cursor" } });
+  assert.ok(!(await g.pendingIds()).includes(approvalId));
+  const redeem = await g.post("/v1/decide/tool", call({ approval: { approvalId } }));
+  assert.match(String(redeem.data.decision.reason), /status=denied/);
+});
+
+test("tool: an expired answer marks the record expired at once — off the queue, not approvable", async () => {
+  const g = await startGuard("expired");
+  const { runId, approvalId } = await gatedToolRun(g);
+
+  await g.post("/v1/finalize/tool", { sessionId: "settle", runId, result: { ok: false, approval: "expired" } });
+  assert.ok(!(await g.pendingIds()).includes(approvalId), "no longer an open question on the dashboard");
+  const status = await g.post("/v1/approvals/status", { approvalIds: [approvalId] });
+  assert.equal(status.data.approvals?.[0]?.status ?? status.data.statuses?.[0]?.status, "expired");
+  const late = await g.post("/v1/approvals/resolve", { approvalId, action: "approve" });
+  assert.match(String(late.data.error), /status 'expired'/);
+});
+
+test("/health advertises approval-resolutions, so a breaker sends host_denied/expired only to a guard that understands them", async () => {
+  // An older guard reads any gated finalize without approval:"denied" as
+  // "Approved — action ran", so a breaker must check before it sends these.
+  const g = await startGuard("caps");
+  const health = await (await fetch(g.healthUrl)).json();
+  assert.ok(health.capabilities.includes("approval-resolutions"));
 });
