@@ -199,6 +199,12 @@ test("the verb says how it was settled, without naming the host", () => {
   const verb = (resolution) =>
     actionVerbFor({ mappedDecision: "approval_required", approvalStatus: "denied", observeMode: false, resolution });
   assert.equal(verb("user_declined"), "was denied approval to run", "an existing answer keeps its existing verb");
-  assert.equal(verb("host_declined"), "was declined automatically in the agent session and did not run");
-  assert.equal(verb("expired"), "got no answer before its approval expired and did not run");
+  assert.equal(verb("host_declined"), "was declined automatically");
+  assert.equal(verb("expired"), "was not approved in time");
+  // The email subject keeps 60 chars of "Agent <verb>: <command>". No new verb
+  // may leave less of the command than the existing denial does.
+  const budget = "Agent was denied approval to run: ".length;
+  for (const r of ["host_declined", "expired"]) {
+    assert.ok(`Agent ${verb(r)}: `.length <= budget, `${r} verb crowds the command out of the email subject`);
+  }
 });

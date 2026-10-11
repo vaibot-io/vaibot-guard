@@ -222,7 +222,7 @@ test("a host's refusal reads as automatic, never as the user's, and never names 
   assert.equal(r.approval.status, "denied");
   assert.equal(r.result.outcome, "blocked", "not denied_by_reviewer: no person is known to have said no");
   assert.match(r.result.summary, /^Declined automatically in the agent session, not by the user — action did not run\./);
-  assert.match(r.action.summary, /was declined automatically in the agent session and did not run/);
+  assert.match(r.action.summary, /^Agent was declined automatically: /);
   assert.doesNotMatch(JSON.stringify(r), /Cursor/, "a host passing result.host is not named either");
 });
 
@@ -236,4 +236,5 @@ test("an approval nobody answered reads 'expired'", async () => {
   const r = captured[0];
   assert.equal(r.result.outcome, "blocked");
   assert.match(r.result.summary, /^Approval expired with no answer — action did not run\./);
+  assert.match(r.action.summary, /^Agent was not approved in time: /);
 });

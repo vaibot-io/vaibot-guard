@@ -58,13 +58,18 @@ export function resolutionSummary({ resolution, bypassed = false }) {
 /**
  * The verb for the receipt's action summary ("Agent <verb>: <command>") for the
  * two additive answers. null for every existing answer, whose verb is unchanged.
+ *
+ * Kept as short as the existing "was denied approval to run": the email subject
+ * keeps only the first 60 characters of the action summary, and the dashboard
+ * history row about 33, so a longer verb hides the command. The qualifiers ("not
+ * by the user", "did not run") live in the result summary, which wraps.
  */
 export function resolutionVerb({ resolution }) {
   switch (resolution) {
     case "host_declined":
-      return "was declined automatically in the agent session and did not run";
+      return "was declined automatically";
     case "expired":
-      return "got no answer before its approval expired and did not run";
+      return "was not approved in time";
     default:
       return null;
   }
