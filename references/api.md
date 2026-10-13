@@ -99,6 +99,7 @@ To support human-in-the-loop approval:
 - `POST /v1/approvals/list` — list **pending** approvals (optionally filtered by `sessionId`)
 - `POST /v1/approvals/resolve` — approve/deny a specific `approvalId`
 - `POST /v1/approvals/status` — the current status of specific `approvalId`s (`list` returns pending only, so an id missing from it is not necessarily approved)
+- `POST /v1/hold` — hold a call for an answer on the VAIBot Authenticator, dashboard or email (see below)
 
 After approval, the caller redeems approval by including:
 
@@ -217,6 +218,46 @@ Response (one entry per distinct id):
 | `unknown` | never issued by this guard, or a terminal record since pruned (pruning only drops `used`/`denied`/`expired`, so `unknown` is never a live approval). Treat it as **not approved**. |
 
 `400` if `approvalIds` is missing, empty, not all non-empty strings, or longer than 100.
+
+### `POST /v1/hold`
+
+Hold a call that is waiting for a person's answer, so it can be answered away from
+the terminal: on the VAIBot Authenticator, in the dashboard or from the alert email.
+The guard posts a pending receipt ("Held for approval — the action has not run. …")
+and learns the answer from the enforcement stream, signed with the policy key.
+
+Request body (`runId` from `/v1/decide/tool`; `sessionId` must match the run's):
+
+```json
+{ "runId": "run_...", "sessionId": "..." }
+```
+
+Response when held:
+
+```json
+{ "ok": true, "held": true, "runId": "run_...", "approvalId": "appr_...", "contentHash": "0x...",
+  "channels": { "authenticator": true, "email": true, "dashboard": true },
+  "expiresAt": "...", "reason": "..." }
+```
+
+`channels` says where the person can answer; a host with neither `authenticator` nor
+`email` should ask in its own prompt instead of waiting. When the call can't be held
+the response is `{ "ok": true, "held": false, "reason": "observe" | "denied" | "offline" | "post_failed" | "approval_<status>" }`
+and the host asks in its own prompt. `404 run_not_found`, `403 session_mismatch`.
+
+A call the guard allowed but the host asks about anyway is held too, with reason "The
+agent host asked for permission before running this call.".
+
+Poll `POST /v1/approvals/status` for the answer: a held approval carries `held: true`
+and `resolutionSource` (where it was answered, e.g. `authenticator`, `dashboard` or
+`email`). `POST /v1/approvals/resolve` can deny a held
+approval but not approve it (`403 held_approval`). Finalize the run as usual; its
+receipt names where the call was answered.
+
+| Env | Default | |
+|---|---|---|
+| `VAIBOT_HELD_APPROVAL_TTL_MS` | 15 min | how long a held approval stays answerable |
+| `VAIBOT_HELD_REDEEM_MS` | 10 min | how long an answer stays redeemable |
 
 ## Ops endpoints
 
