@@ -18,6 +18,7 @@ import path from "node:path";
 import { classify, toolKind } from "./classifier.mjs";
 import { receiptOutcome, actionVerbFor } from "./lib/receipt-shape.mjs";
 import { approvalResolution, resolutionSummary } from "./lib/approval-resolution.mjs";
+import { verifyApprovalResolution, heldApprovalTransition } from "./lib/approval-resolution-signed.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE, readContainment, writeContainment } from "./lib/guard-bootstrap.mjs";
@@ -797,8 +798,16 @@ async function streamContainment() {
         for (const frame of frames) {
           const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
           if (!dataLine) continue; // a ': ping' keepalive
+          const eventLine = frame.split("\n").find((l) => l.startsWith("event:"));
+          const eventName = eventLine ? eventLine.slice(6).trim() : "containment";
           try {
             const payload = JSON.parse(dataLine.slice(5).trim());
+            if (eventName === "approval") {
+              // An answer to a held call. Verified inside; never touches containment.
+              applyServerResolution(payload?.resolution);
+              continue;
+            }
+            if (eventName !== "containment") continue; // unknown events are ignored
             if (typeof payload?.reason === "string") CONTAINMENT_REASON = payload.reason;
             adoptContainment(payload?.contained, payload?.snapshot ? "stream (snapshot)" : "stream");
           } catch {
@@ -855,6 +864,16 @@ const APPROVALS = new Map(); // approvalId -> record (in-memory, never persisted
 
 const VAIBOT_APPROVAL_TTL_MS = Math.max(30_000, Number(process.env.VAIBOT_APPROVAL_TTL_MS || 5 * 60_000));
 
+// A HELD approval is one the host asked us to put in front of the person
+// (POST /v1/hold): it is posted to the control plane as a pending receipt and
+// answered on the phone, the dashboard or an email link. It lives longer than
+// an in-session one because the person may not be at the terminal, but the
+// server's pending window stays the authority on whether it is still open.
+// Still in memory only (D-140): the server holds the durable record.
+const VAIBOT_HELD_APPROVAL_TTL_MS = Math.max(60_000, Number(process.env.VAIBOT_HELD_APPROVAL_TTL_MS || 15 * 60_000));
+// After a remote "approve", the call must be used promptly.
+const VAIBOT_HELD_REDEEM_MS = Math.max(30_000, Number(process.env.VAIBOT_HELD_REDEEM_MS || 10 * 60_000));
+
 function isApprovalExpired(rec) {
   return Boolean(rec?.expiresAt) && Date.now() > Date.parse(rec.expiresAt);
 }
@@ -907,7 +926,7 @@ function approvalStatus(approvalId) {
   if (!rec) return { approvalId, status: "unknown" };
   const live = rec.status === "pending" || rec.status === "approved";
   const status = live && isApprovalExpired(rec) ? "expired" : rec.status;
-  return { approvalId, status, expiresAt: rec.expiresAt, resolvedAt: rec.resolvedAt ?? null, usedAt: rec.usedAt ?? null };
+  return { approvalId, status, expiresAt: rec.expiresAt, resolvedAt: rec.resolvedAt ?? null, usedAt: rec.usedAt ?? null, ...(rec.held ? { held: true, resolutionSource: rec.resolutionSource ?? null } : {}) };
 }
 
 const APPROVAL_STATUS_MAX_IDS = 100;
@@ -957,6 +976,27 @@ function resolveApproval({ approvalId, action }) {
   writeApproval(rec);
 
   return { ok: true, approvalId: rec.approvalId, status: rec.status, expiresAt: rec.expiresAt, reason: rec.reason, request: rec.request };
+}
+
+// Apply a person's answer from the control plane to the held approval for that
+// run. The answer must verify against the pinned policy key first: the stream
+// is opened with an API key the agent's host also holds. Only a pending held
+// record moves (see heldApprovalTransition), so a replay cannot re-approve.
+function applyServerResolution(doc) {
+  const v = verifyApprovalResolution(doc, POLICY_PUBKEY);
+  if (!v.ok) {
+    console.error(`[vaibot-guard] ignored an approval answer from the stream (${v.reason}).`);
+    return false;
+  }
+  for (const rec of APPROVALS.values()) {
+    if (rec.runId !== v.answer.runId) continue;
+    const next = heldApprovalTransition(rec, v.answer, { redeemMs: VAIBOT_HELD_REDEEM_MS });
+    if (!next) return false;
+    Object.assign(rec, next);
+    writeApproval(rec);
+    return true;
+  }
+  return false;
 }
 
 function markApprovalUsed({ approvalId }) {
@@ -1991,7 +2031,14 @@ function postContainmentDenyReceipt({ runId, sessionId, intent, decision, risk, 
   }).catch((e) => console.error(`[vaibot-guard] containment receipt post failed: ${e?.message || e}`));
 }
 
-function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion, effectiveMode, hostBypass }) {
+// Where a held call was answered, for the receipt's result summary.
+const REMOTE_ANSWER_PLACE = {
+  authenticator: "on the VAIBot Authenticator",
+  dashboard: "in the VAIBot dashboard",
+  email: "from an email link",
+};
+
+function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion, effectiveMode, hostBypass, phase = "finalize" }) {
   if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return Promise.resolve(null);
 
   const toolName = String(intent?.toolName || intent?.tool || intent?.cmd?.split(" ")[0] || "unknown");
@@ -2078,14 +2125,23 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
 
   // The gate is resolved by the time this receipt is written, so say what
   // happened rather than restating the reason it was gated.
+  // A held call answered away from the terminal says where it was answered.
+  const heldRec = decision?.approvalId ? readApproval(decision.approvalId) : null;
+  const answeredAt = heldRec?.held ? REMOTE_ANSWER_PLACE[heldRec.resolutionSource] : undefined;
+
+  // A hold is posted before anyone has answered (POST /v1/hold).
   const resultSummary =
-    mappedDecision === "approval_required" && !observing
-      ? `${resolutionSummary({ resolution, bypassed })} ${policyReason}`
-      : policyReason;
+    phase === "hold"
+      ? `Held for approval — the action has not run. ${policyReason}`
+      : mappedDecision === "approval_required" && !observing && answeredAt
+        ? `${heldRec.status === "denied" || resolution !== null ? "Denied" : "Approved"} ${answeredAt} — action ${resolution === null ? "ran" : "did not run"}. ${policyReason}`
+        : mappedDecision === "approval_required" && !observing
+          ? `${resolutionSummary({ resolution, bypassed })} ${policyReason}`
+          : policyReason;
 
   const receiptPayload = {
     run_id: runId,
-    idempotency_key: `${runId}:finalize`,
+    idempotency_key: `${runId}:${phase === "hold" ? "hold" : "finalize"}`,
     agent: { id: agentId, name: agentId },
     action: {
       tool: toolName,
@@ -2617,6 +2673,93 @@ const server = http.createServer(async (req, res) => {
     // The terminal answer for specific approvals. `/v1/approvals/list` returns
     // PENDING only, so an id missing from it may have been approved, denied, used
     // or expired — a host that read "missing" as "approved" auto-retried refusals.
+    // POST /v1/hold — the host is about to show its own permission prompt for a
+    // run; put the call in front of the person instead. The run's approval is
+    // marked held, posted to the control plane as a pending receipt (so it
+    // appears on the phone, in the dashboard and in an alert email), and its
+    // answer arrives signed on the enforcement stream. The host then polls
+    // /v1/approvals/status. A call the guard had allowed but the host still
+    // asks about is held too: the host's prompt is the gate.
+    //
+    // Never grants anything: a hold only creates or keeps a PENDING approval.
+    if (req.method === "POST" && req.url === "/v1/hold") {
+      if (!requireAuth(req, res)) return;
+      const raw = await readBody(req);
+      let input;
+      try {
+        input = JSON.parse(raw || "{}");
+      } catch {
+        return json(res, 400, { ok: false, error: "Invalid JSON" });
+      }
+      const runId = String(input?.runId || "");
+      const sessionId = String(input?.sessionId || "");
+      if (!runId) return json(res, 400, { ok: false, error: "Missing runId" });
+      const ctx = readRunContext(runId);
+      if (!ctx) return json(res, 404, { ok: false, error: "run_not_found" });
+      if (sessionId && ctx.sessionId && ctx.sessionId !== sessionId) {
+        return json(res, 403, { ok: false, error: "session_mismatch" });
+      }
+      const notHeld = (reason) => json(res, 200, { ok: true, held: false, reason });
+      if (normalizeMode(EFFECTIVE_MODE) !== "enforce") return notHeld("observe");
+      if (ctx.decision?.decision === "deny") return notHeld("denied");
+      if (!CANONICAL_GOVERNANCE_BASE || !VAIBOT_API_KEY) return notHeld("offline");
+
+      let appr = ctx.decision?.approvalId ? readApproval(ctx.decision.approvalId) : null;
+      if (ctx.decision?.decision === "approve" && appr && appr.status !== "pending") {
+        return notHeld(`approval_${appr.status}`);
+      }
+      if (ctx.decision?.decision !== "approve" || !appr) {
+        // Allowed by policy, but the host still asks the person: hold it on
+        // the host's behalf. Bound to this exact call.
+        const reason = "The agent host asked for permission before running this call.";
+        appr = createApproval({
+          sessionId: ctx.sessionId,
+          kind: "tool",
+          reason,
+          request: { toolName: ctx.intent?.toolName, paramsHash: ctx.paramsHash, paramsPreview: ctx.intent?.params },
+        });
+        ctx.decision = { ...(ctx.decision || {}), decision: "approve", reason, approvalId: appr.approvalId, hostPrompt: true };
+      }
+
+      appr.held = true;
+      appr.runId = runId;
+      appr.expiresAt = new Date(Date.now() + VAIBOT_HELD_APPROVAL_TTL_MS).toISOString();
+      writeApproval(appr);
+      ctx.held = true;
+      writeRunContext(runId, ctx);
+
+      const posted = await postGovernanceReceipt({
+        runId,
+        sessionId: ctx.sessionId,
+        intent: ctx.intent,
+        decision: ctx.decision,
+        risk: ctx.risk,
+        result: null,
+        policyVersion: ctx.policyVersion,
+        effectiveMode: ctx.effectiveMode,
+        hostBypass: ctx.hostBypass,
+        phase: "hold",
+      }).catch(() => null);
+      if (!posted?.ok || !posted?.content_hash) {
+        // Nobody else can see it, so nobody else can answer it: let the host
+        // ask in its own prompt. The approval stays pending and is settled by
+        // the finalize as usual.
+        return json(res, 200, { ok: true, held: false, reason: "post_failed", approvalId: appr.approvalId });
+      }
+      appr.serverContentHash = posted.content_hash;
+      writeApproval(appr);
+      return json(res, 200, {
+        ok: true,
+        held: true,
+        runId,
+        approvalId: appr.approvalId,
+        contentHash: posted.content_hash,
+        channels: posted.approval_channels ?? null,
+        expiresAt: appr.expiresAt,
+        reason: ctx.decision.reason,
+      });
+    }
+
     if (req.method === "POST" && req.url === "/v1/approvals/status") {
       if (!requireAuth(req, res)) return;
       const raw = await readBody(req);
@@ -2728,6 +2871,17 @@ const server = http.createServer(async (req, res) => {
       const approvalId = String(input.approvalId || "");
       const action = String(input.action || "");
       if (!approvalId) return json(res, 400, { ok: false, error: "Missing approvalId" });
+      // A held call is answered by the person on the phone, the dashboard or an
+      // email link, and reaches us signed. This route takes the guard token,
+      // which the agent's host holds too, so it may refuse a held call but
+      // never approve one.
+      if (action === "approve" && readApproval(approvalId)?.held === true) {
+        return json(res, 403, {
+          ok: false,
+          error: "held_approval",
+          message: "This call is waiting for an answer on your phone, by email or in the dashboard; it can't be approved here.",
+        });
+      }
       if (action !== "approve" && action !== "deny") return json(res, 400, { ok: false, error: "Invalid action" });
 
       const out = resolveApproval({ approvalId, action });
@@ -3093,6 +3247,7 @@ const server = http.createServer(async (req, res) => {
         risk,
         receiptTier,
         intent: { toolName, params: redactIntent(params), workspaceDir },
+        paramsHash,
         decision,
         precheckAudit: audit,
         ts: nowIso(),
@@ -3187,7 +3342,9 @@ const server = http.createServer(async (req, res) => {
       // covered by the tier-1 Merkle ledger above. Missing tier => emit (fail-safe:
       // degrade toward more provenance, never silently drop an audit trail).
       const receiptTier = ctx1?.receiptTier ?? "receipt";
-      const receiptEmitted = receiptTier === "receipt";
+      // A held run was posted at hold time; its finalize settles that receipt,
+      // whatever its tier.
+      const receiptEmitted = receiptTier === "receipt" || ctx1?.held === true;
       if (receiptEmitted) {
         postGovernanceReceipt({
           runId,
@@ -3285,7 +3442,9 @@ const server = http.createServer(async (req, res) => {
       // M: tier-2 governance receipt is earned (see /v1/finalize/tool). Missing
       // tier => emit (fail-safe).
       const receiptTier = ctx1?.receiptTier ?? "receipt";
-      const receiptEmitted = receiptTier === "receipt";
+      // A held run was posted at hold time; its finalize settles that receipt,
+      // whatever its tier.
+      const receiptEmitted = receiptTier === "receipt" || ctx1?.held === true;
       if (receiptEmitted) {
         postGovernanceReceipt({
           runId,

@@ -33,6 +33,28 @@ All notable changes to `@vaibot/guard` are documented here.
   since pruned; pruning only drops terminal records, so `unknown` is never a live
   approval. The endpoint is read-only and needs the guard token. `/health` advertises it
   as the `approval-status` capability.
+- **Held calls: answer an approval away from the terminal.** `POST /v1/hold
+  { runId, sessionId }` holds a call that is waiting for a person's answer and posts
+  it to VAIBot as pending, so it can be answered on the VAIBot Authenticator, in the
+  dashboard or from the alert email while the agent waits. The receipt reads "Held for
+  approval — the action has not run. …". The guard learns the answer from the
+  enforcement stream, where it arrives signed with the policy key and is verified
+  before it changes anything; `/v1/approvals/status` reports it as `held: true` and
+  `resolutionSource` (where it was answered, e.g. `authenticator`, `dashboard` or `email`).
+  - Works for a call the guard escalated, and for one it allowed but the agent host
+    asks about anyway (reason "The agent host asked for permission before running
+    this call.").
+  - Not held, and the host asks in its own prompt, when the account is observing,
+    the call was denied, the guard has no API key or the post fails
+    (`{ held: false, reason }`).
+  - A held approval lives `VAIBOT_HELD_APPROVAL_TTL_MS` (default 15 min); an answer
+    must be redeemed within `VAIBOT_HELD_REDEEM_MS` (default 10 min).
+  - A held call is approved only through VAIBot: `POST /v1/approvals/resolve` can
+    still deny it, but answers `403 held_approval` to an approve.
+  - A held call always gets a closing receipt, which names where it was answered,
+    e.g. "Approved on the VAIBot Authenticator — action ran." or "Denied in the VAIBot
+    dashboard — action did not run.". **Additive only:** the wording of every other
+    receipt is unchanged.
 - **Docs:** `references/api.md` now states that an escalation's `approvalId`,
   `expiresAt` and `scope` are **inside `decision`**, not at the top level of the
   response.
