@@ -218,6 +218,7 @@ export async function httpHealth(host, port, token, opts = {}) {
     if (body && body.ok === true) {
       return {
         ok: true,
+        service: body.service ?? null,
         version: body.version ?? null,
         instanceId: body.instanceId ?? null,
         // Whether the guard accepts the token we sent: true/false from a guard
@@ -239,6 +240,37 @@ async function tryReuse(d, host, requiredVersion) {
     return { ...lock, version: h.version ?? lock.version ?? null, ok: true }
   }
   return null
+}
+
+// A guard names itself on /health without a token. One answering on any
+// candidate port is the machine's guard, whatever its version and whether or
+// not guard.json describes it, so nothing is launched beside it.
+async function findGuard(d, host, ports) {
+  for (const port of ports) {
+    const h = await d.health(host, port)
+    if (h && h.ok && h.service === 'vaibot-guard') return { port, health: h }
+  }
+  return null
+}
+
+function standDown(found, requiredVersion) {
+  const { port, health } = found
+  if (!isCompatible(health.version, requiredVersion)) {
+    return {
+      ok: false,
+      status: 'incompatible',
+      port,
+      version: health.version ?? null,
+      reason: `the running guard on port ${port} is ${health.version ?? 'an unknown version'}, below the required ${requiredVersion}; restart it to upgrade — not launching another`,
+    }
+  }
+  return {
+    ok: false,
+    status: 'unregistered',
+    port,
+    version: health.version ?? null,
+    reason: `a guard is running on port ${port} but guard.json does not describe it; restart it to re-register — not launching another`,
+  }
 }
 
 /**
@@ -292,6 +324,9 @@ export async function ensureGuard(opts = {}, deps = {}) {
       }
     }
 
+    const running = await findGuard(d, host, candidatePorts)
+    if (running) return standDown(running, requiredVersion)
+
     if (typeof d.launch !== 'function') {
       return { ok: false, status: 'no-launcher', reason: 'no guard running and no launcher provided' }
     }
@@ -328,7 +363,9 @@ export async function ensureGuard(opts = {}, deps = {}) {
         if (h && h.ok && isCompatible(h.version, requiredVersion) && existingLock && existingLock.port === port) {
           return { ...existingLock, version: h.version ?? existingLock.version ?? null, ok: true, status: 'reused' }
         }
-        // Foreign squatter or incompatible — try the next candidate port.
+        // A guard bound it after the scan above: it wins.
+        if (h && h.ok && h.service === 'vaibot-guard') return standDown({ port, health: h }, requiredVersion)
+        // Not a guard — try the next candidate port.
         continue
       }
       // outcome 'failed' — try the next port.
