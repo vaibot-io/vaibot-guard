@@ -54,17 +54,23 @@ export function tcpProbe(host, port, opts = {}) {
 
 /**
  * Build a launch(host, port, token) for ensureGuard that spawns the guard
- * service script detached and waits for an identity-bearing /health.
+ * service script detached and waits for /health from THAT guard.
  *   - port already occupied → { outcome: 'in-use' } (ensureGuard identity-checks)
  *   - became healthy        → { outcome: 'launched', health, pid }
  *   - never healthy / error  → { outcome: 'failed', error }
+ *
+ * "That guard" is checked, not assumed: /health must accept the token we gave
+ * the child. Another guard that bound the port first (one already starting
+ * when we probed) answers /health too, but with its own token, and our child
+ * exits on EADDRINUSE. Taking that answer as success is how a launcher once
+ * wrote its unused token into the lock beside a running guard.
  */
 export function makeLauncher(cfg = {}) {
   // 10s default cold-start budget (was 4s): a fresh machine's first spawn pays
   // module load + policy-bundle fetch + bind; 4s races that and reports a false
   // "failed". Override via cfg.healthTimeoutMs.
   const { guardScript, baseEnv = {}, healthTimeoutMs = 10000, pollMs = 150 } = cfg
-  return async function launch(host, port, token) {
+  return async function launch(host, port, token, ctx = {}) {
     if (await tcpProbe(host, port)) return { outcome: 'in-use' }
 
     // Tee the daemon's own stdout/stderr to ~/.vaibot/guard/launch.log so a boot
@@ -81,6 +87,8 @@ export function makeLauncher(cfg = {}) {
           VAIBOT_GUARD_HOST: host,
           VAIBOT_GUARD_PORT: String(port),
           VAIBOT_GUARD_TOKEN: token,
+          // We hold the launch lock on the child's behalf; it must not wait on it.
+          ...(ctx.lockHeld ? { VAIBOT_GUARD_LAUNCH_LOCK_HELD: '1' } : {}),
         },
         detached: true,
         stdio: childStdio,
@@ -89,11 +97,26 @@ export function makeLauncher(cfg = {}) {
     } catch (error) {
       return { outcome: 'failed', error }
     }
+    let exited = false
+    child.once('exit', () => {
+      exited = true
+    })
 
     const deadline = Date.now() + healthTimeoutMs
     while (Date.now() < deadline) {
       const h = await httpHealth(host, port, token, { timeoutMs: 800 })
-      if (h && h.ok) return { outcome: 'launched', health: h, pid: child.pid }
+      if (h && h.ok && h.authorized === true) return { outcome: 'launched', health: h, pid: child.pid }
+      // Someone else's guard is on the port: ours lost the bind (or soon will).
+      if ((h && h.ok && h.authorized === false) || exited) {
+        try {
+          if (!exited && child.pid) process.kill(child.pid)
+        } catch {
+          /* ignore */
+        }
+        return (await tcpProbe(host, port))
+          ? { outcome: 'in-use' }
+          : { outcome: 'failed', error: new Error(`guard exited before becoming healthy — see ${LAUNCH_LOG}`) }
+      }
       await new Promise((r) => setTimeout(r, pollMs))
     }
     try {

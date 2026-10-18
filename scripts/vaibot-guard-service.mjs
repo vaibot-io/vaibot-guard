@@ -21,7 +21,7 @@ import { approvalResolution, resolutionSummary } from "./lib/approval-resolution
 import { verifyApprovalResolution, heldApprovalTransition } from "./lib/approval-resolution-signed.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
-import { writeLock, readLock, LOCK_FILE, readContainment, writeContainment } from "./lib/guard-bootstrap.mjs";
+import { writeLock, readLock, LOCK_FILE, readContainment, writeContainment, httpHealth, acquireFileLock, launchLockHolder, pidAlive, releaseFileLockIfOurs } from "./lib/guard-bootstrap.mjs";
 import { loadGuardEnvFile } from "./lib/env-file.mjs";
 import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv, urlOverrideAllowed, gateUrlOverride, readGuardEndpoint } from "./lib/creds.mjs";
 
@@ -41,6 +41,34 @@ if (_envFileKeys.length) {
 // credentials.json endpoint → a last-resort default hint. Never a hardcoded contract.
 const PORT = Number(process.env.VAIBOT_GUARD_PORT) || readGuardEndpoint()?.port || 39111;
 const HOST = process.env.VAIBOT_GUARD_HOST || "127.0.0.1";
+
+// ---- One guard per machine: adopt a running guard, never start a second.
+// A guard that is already registered and answering is adopted: this process
+// exits 0 (so a supervisor with Restart=on-failure leaves it be) without
+// binding or touching guard.json. Otherwise it holds the launch lock while it
+// starts — the first policy fetch can take a while before the port is bound —
+// so a plugin launcher that looks in that window sees a guard starting and
+// waits for it instead of launching another.
+function adoptAndExit(what) {
+  // eslint-disable-next-line no-console
+  console.error(`[vaibot-guard] ${what}; adopting it — not starting a second guard.`);
+  releaseFileLockIfOurs();
+  process.exit(0);
+}
+{
+  const running = readLock();
+  if (running && running.port && running.pid !== process.pid && pidAlive(running.pid)) {
+    const h = await httpHealth(running.host || HOST, running.port, undefined);
+    if (h && h.ok) adoptAndExit(`a guard is already running on ${running.host || HOST}:${running.port} (pid ${running.pid})`);
+  }
+}
+if (process.env.VAIBOT_GUARD_LAUNCH_LOCK_HELD !== "1" && !acquireFileLock(undefined, { role: "daemon" })) {
+  const holder = launchLockHolder();
+  if (holder && holder.role === "daemon" && holder.pid !== process.pid && pidAlive(holder.pid)) {
+    adoptAndExit(`another guard is starting (pid ${holder.pid})`);
+  }
+  // A launcher holds it and is about to start a guard; the port decides who runs.
+}
 
 // ---- API config from the credentials file (v3 split: V2 governance / V1 provenance)
 // The guard derives its api key + governance/provenance bases from the resolved
@@ -1406,6 +1434,18 @@ function getBearer(req) {
   return m ? m[1].trim() : "";
 }
 
+// /health stays unauthenticated, but a caller that presents a token learns
+// whether this guard accepts it — how a launcher tells the guard it started
+// from another guard that already holds the port. Absent when no token is sent.
+function healthAuthorized(req) {
+  const presented = getBearer(req);
+  if (!presented) return {};
+  if (!VAIBOT_GUARD_TOKEN) return { authorized: true }; // auth disabled: any token works
+  const a = Buffer.from(presented);
+  const b = Buffer.from(VAIBOT_GUARD_TOKEN);
+  return { authorized: a.length === b.length && timingSafeEqual(a, b) };
+}
+
 function requireAuth(req, res) {
   if (!VAIBOT_GUARD_TOKEN) return true; // auth disabled
   const bearer = getBearer(req);
@@ -2542,7 +2582,7 @@ function appendAudit(event) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
-      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE, capabilities: GUARD_CAPABILITIES, contained: CONTAINMENT_ARMED });
+      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE, capabilities: GUARD_CAPABILITIES, contained: CONTAINMENT_ARMED, ...healthAuthorized(req) });
     }
 
     // Read-only view of the active signed policy + provenance (F-155). Like
@@ -3477,8 +3517,11 @@ if (VAIBOT_PROVE_MODE === "required" && (!PROVENANCE_BASE || !VAIBOT_API_KEY)) {
   process.exit(2);
 }
 
-server.on("error", (err) => {
+server.on("error", async (err) => {
   if (err && err.code === "EADDRINUSE") {
+    // Lost the bind to a guard that started at the same time: that one runs.
+    const h = await httpHealth(HOST, PORT, undefined);
+    if (h && h.ok) adoptAndExit(`a guard is already running on ${HOST}:${PORT}`);
     // eslint-disable-next-line no-console
     console.error(`[vaibot-guard] failed to bind http://${HOST}:${PORT} (EADDRINUSE). Another process is using this port.`);
     // eslint-disable-next-line no-console
@@ -3516,6 +3559,8 @@ server.listen(PORT, HOST, () => {
     // eslint-disable-next-line no-console
     console.error(`[vaibot-guard] could not write discovery lock: ${e?.message || e}`);
   }
+  // Registered: launchers can find us through guard.json from here on.
+  releaseFileLockIfOurs();
 });
 
 // Release the rendezvous lock on shutdown, but only if it still points at us
@@ -3537,6 +3582,7 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   });
 }
 process.on("exit", releaseRendezvousIfOurs);
+process.on("exit", () => releaseFileLockIfOurs());
 
 // Time-based checkpointing (every 10 minutes by default): create a checkpoint if any new events
 // have arrived since the last checkpoint and time has elapsed.

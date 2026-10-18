@@ -12,7 +12,12 @@
 //      walk candidate ports; the guard binds one (port-as-mutex). On
 //      EADDRINUSE, probe /health — if it's OUR compatible guard, reuse it;
 //      a foreign squatter or incompatible version → try the next port.
-//   3. On success, write the lock atomically (file 0600 / dir 0700).
+//      A guard that is still starting holds the same lock (role 'daemon'),
+//      so a launcher that finds it held by a live guard adopts it rather
+//      than launching a second one: one guard per machine.
+//   3. On success, write the lock atomically (file 0600 / dir 0700) — unless
+//      the guard already registered itself, and never over another guard's
+//      token.
 //
 // The orchestration takes injectable deps so it is fully unit-testable without
 // real sockets/processes. Real defaults: httpHealth (GET /health), fs lock I/O.
@@ -69,14 +74,40 @@ export function genToken() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/** True if a process with this pid exists (signal 0 checks without signalling). */
+export function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return !!e && e.code === 'EPERM' // exists, owned by someone else
+  }
+}
+
+/** Who holds the launch lock: `{ pid, at, role }`, or null if nobody (or unreadable). */
+export function launchLockHolder(path = LAUNCH_LOCK_FILE) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf-8'))
+  } catch {
+    return null
+  }
+}
+
 /**
  * Cross-process single-flight mutex via an O_EXCL lock file so two concurrent
  * hooks/plugins cannot both spawn a guard (the OS port-bind is only a backstop,
- * and that's a check-then-act window). Steals a lock older than staleMs (a
- * crashed launcher) so we never deadlock. Returns true iff WE now hold it.
+ * and that's a check-then-act window). A guard holds it too while it starts
+ * (`role: 'daemon'`), until it has bound and registered.
+ *
+ * Steals a lock whose holder is gone so we never deadlock: a dead pid at once,
+ * or a launcher's lock older than staleMs. A starting guard's lock is never
+ * stolen while that guard is alive — its first policy fetch can outlast
+ * staleMs, and stealing it is exactly how a second guard got launched.
+ * Returns true iff WE now hold it.
  */
 export function acquireFileLock(path = LAUNCH_LOCK_FILE, opts = {}) {
-  const { staleMs = 10_000, now = () => Date.now() } = opts
+  const { staleMs = 10_000, now = () => Date.now(), role = 'launcher', alive = pidAlive } = opts
   try {
     mkdirSync(GUARD_DIR, { recursive: true, mode: 0o700 })
   } catch {
@@ -85,7 +116,7 @@ export function acquireFileLock(path = LAUNCH_LOCK_FILE, opts = {}) {
   try {
     const fd = openSync(path, 'wx') // O_CREAT | O_EXCL — fails EEXIST if held
     try {
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, at: now() }))
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, at: now(), role }))
     } finally {
       closeSync(fd)
     }
@@ -94,7 +125,10 @@ export function acquireFileLock(path = LAUNCH_LOCK_FILE, opts = {}) {
     if (!e || e.code !== 'EEXIST') return false
     try {
       const held = JSON.parse(readFileSync(path, 'utf-8'))
-      if (held && typeof held.at === 'number' && now() - held.at > staleMs) {
+      const holderGone = held && Number.isInteger(held.pid) && !alive(held.pid)
+      const launcherStale =
+        held && held.role !== 'daemon' && typeof held.at === 'number' && now() - held.at > staleMs
+      if (holderGone || launcherStale) {
         // Atomic steal: only ONE racer's rename of the stale lock wins; the
         // loser gets ENOENT and stays unlocked, so two processes can't both
         // believe they hold it (unlink+recreate would let both win).
@@ -124,6 +158,12 @@ export function releaseFileLock(path = LAUNCH_LOCK_FILE) {
   } catch {
     /* already released */
   }
+}
+
+/** Release the launch lock only if this process holds it (it may have been stolen). */
+export function releaseFileLockIfOurs(path = LAUNCH_LOCK_FILE) {
+  const held = launchLockHolder(path)
+  if (held && held.pid === process.pid) releaseFileLock(path)
 }
 
 /**
@@ -176,7 +216,14 @@ export async function httpHealth(host, port, token, opts = {}) {
     if (!res.ok) return null
     const body = await res.json().catch(() => ({}))
     if (body && body.ok === true) {
-      return { ok: true, version: body.version ?? null, instanceId: body.instanceId ?? null }
+      return {
+        ok: true,
+        version: body.version ?? null,
+        instanceId: body.instanceId ?? null,
+        // Whether the guard accepts the token we sent: true/false from a guard
+        // that reports it, null from one that predates the field.
+        authorized: typeof body.authorized === 'boolean' ? body.authorized : null,
+      }
     }
     return null
   } catch {
@@ -198,8 +245,8 @@ async function tryReuse(d, host, requiredVersion) {
  * Idempotent discover-or-launch. Pure orchestration; inject deps to test.
  *
  * @param {{host?:string, requiredVersion?:string|null, candidatePorts?:number[], lockPath?:string}} opts
- * @param {{readLock?, writeLock?, health?, launch?, acquireLock?, releaseLock?, genToken?, now?}} deps
- *   launch(host,port,token) resolves:
+ * @param {{readLock?, writeLock?, health?, launch?, acquireLock?, releaseLock?, lockHolder?, alive?, genToken?, now?}} deps
+ *   launch(host,port,token,{lockHeld}) resolves:
  *     { outcome:'launched', health:{ok,version}, pid? } | { outcome:'in-use' } | { outcome:'failed', error? }
  */
 export async function ensureGuard(opts = {}, deps = {}) {
@@ -215,6 +262,8 @@ export async function ensureGuard(opts = {}, deps = {}) {
     launch: deps.launch,
     acquireLock: deps.acquireLock ?? (() => defaultAcquireLock()),
     releaseLock: deps.releaseLock ?? (async () => releaseFileLock()),
+    lockHolder: deps.lockHolder ?? (() => launchLockHolder()),
+    alive: deps.alive ?? pidAlive,
     genToken: deps.genToken ?? genToken,
     now: deps.now ?? (() => Date.now()),
   }
@@ -229,13 +278,27 @@ export async function ensureGuard(opts = {}, deps = {}) {
     const recheck = await tryReuse(d, host, requiredVersion)
     if (recheck) return { ...recheck, status: 'reused' }
 
+    // A guard that is still starting holds the launch lock. Adopt it: never
+    // launch a second guard beside it, even if it has not bound a port yet.
+    if (!acquired) {
+      const holder = d.lockHolder()
+      if (holder && holder.role === 'daemon' && d.alive(holder.pid)) {
+        return {
+          ok: false,
+          status: 'starting',
+          pid: holder.pid,
+          reason: `a guard is starting (pid ${holder.pid}); not launching another`,
+        }
+      }
+    }
+
     if (typeof d.launch !== 'function') {
       return { ok: false, status: 'no-launcher', reason: 'no guard running and no launcher provided' }
     }
 
     const token = d.genToken()
     for (const port of candidatePorts) {
-      const res = await d.launch(host, port, token)
+      const res = await d.launch(host, port, token, { lockHeld: !!acquired })
       if (res && res.outcome === 'launched' && res.health && res.health.ok) {
         const lock = {
           version: res.health.version ?? null,
@@ -245,7 +308,16 @@ export async function ensureGuard(opts = {}, deps = {}) {
           pid: res.pid ?? null,
           startedAt: d.now(),
         }
-        d.writeLock(lock)
+        // The guard registers itself once it has bound, so the lock usually
+        // already carries this token: leave it (the guard's own record is
+        // richer). Never write over a live guard's record with another token —
+        // that left every client holding a token the running guard never issued.
+        const current = d.readLock()
+        if (current && current.token !== token) {
+          const other = await tryReuse(d, host, requiredVersion)
+          if (other) return { ...other, status: 'reused' }
+        }
+        if (!current || current.token !== token) d.writeLock(lock)
         return { ...lock, ok: true, status: 'launched' }
       }
       if (res && res.outcome === 'in-use') {
