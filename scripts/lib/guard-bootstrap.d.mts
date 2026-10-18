@@ -21,6 +21,8 @@ export interface GuardLock {
 
 export interface GuardHealth {
   ok: boolean
+  /** `"vaibot-guard"` from a guard; how a launcher recognises one without its token. */
+  service?: string | null
   version: string | null
   instanceId?: string | null
   /** Whether the guard accepts the token sent; null from a guard that predates the field. */
@@ -64,6 +66,11 @@ export type EnsureGuardResult =
   | { ok: false; status: 'no-launcher' | 'launch-failed'; reason: string }
   /** A guard is starting and holds the launch lock: adopt it, launch nothing. */
   | { ok: false; status: 'starting'; pid: number; reason: string }
+  /**
+   * A guard is running on a candidate port but guard.json does not describe
+   * it, or it is older than required. It wins: nothing is launched beside it.
+   */
+  | { ok: false; status: 'unregistered' | 'incompatible'; port: number; version: string | null; reason: string }
 
 /** Machine-wide containment state, as the guard writes it. */
 export interface Containment {

@@ -11,8 +11,10 @@ import { reservePort } from "./lib/free-port.mjs";
 // One guard per machine. A guard that finds another one registered and
 // answering adopts it and exits 0 without touching guard.json; a guard that is
 // still starting holds the launch lock, so a plugin launcher waits for it
-// instead of launching a second; and a launcher only believes /health from the
-// guard it started (the one that accepts its token).
+// instead of launching a second; a guard answering on any candidate port stops
+// a launch, even one guard.json does not describe or one older than required;
+// and a launcher only believes /health from the guard it started (the one that
+// accepts its token).
 //
 // Hermetic: this process and every guard it starts use a temp HOME, so nothing
 // here can reach the developer's live rendezvous lock.
@@ -101,6 +103,63 @@ test("a launch with no registration yet writes one", async () => {
   await ensureGuard({ candidatePorts: [1] }, d);
   assert.equal(calls.writes.length, 1);
   assert.equal(calls.writes[0].token, "tok-new");
+});
+
+// Answers /health as a guard on `port` only, whatever token is sent.
+const guardOn = (port, version = "2.4.0") => async (_h, p) =>
+  p === port ? { ok: true, service: "vaibot-guard", version } : null;
+
+test("a guard guard.json does not describe is not launched beside", async () => {
+  const { calls, d } = deps({ health: guardOn(2) });
+  const r = await ensureGuard({ candidatePorts: [1, 2, 3] }, d);
+  assert.equal(r.status, "unregistered");
+  assert.equal(r.port, 2);
+  assert.equal(calls.launch, 0);
+  assert.equal(calls.writes.length, 0);
+});
+
+test("an older guard than required is not launched beside", async () => {
+  const lock = { host: "127.0.0.1", port: 1, token: "tok-old", pid: 9 };
+  const { calls, d } = deps({ readLock: () => lock, health: guardOn(1, "2.3.0") });
+  const r = await ensureGuard({ candidatePorts: [1, 2], requiredVersion: "2.4.0" }, d);
+  assert.equal(r.status, "incompatible");
+  assert.equal(r.version, "2.3.0");
+  assert.equal(calls.launch, 0);
+  assert.equal(calls.writes.length, 0);
+});
+
+test("a guard that binds the port first ends the launch: no next port", async () => {
+  let bound = false;
+  const ports = [];
+  const { calls, d } = deps({
+    health: async (_h, p) => (bound && p === 1 ? { ok: true, service: "vaibot-guard", version: "2.4.0" } : null),
+    launch: async (_h, p) => {
+      ports.push(p);
+      bound = true;
+      return { outcome: "in-use" };
+    },
+  });
+  const r = await ensureGuard({ candidatePorts: [1, 2] }, d);
+  assert.equal(r.status, "unregistered");
+  assert.deepEqual(ports, [1], "never tried port 2");
+  assert.equal(calls.writes.length, 0);
+});
+
+test("a port held by something that is not a guard is still skipped", async () => {
+  const ports = [];
+  const { d } = deps({
+    health: async (_h, p) => (p === 1 ? { ok: true, service: "something-else", version: "1.0.0" } : null),
+    launch: async (_h, p) => {
+      ports.push(p);
+      return p === 1
+        ? { outcome: "in-use" }
+        : { outcome: "launched", health: { ok: true, version: "2.4.0", authorized: true }, pid: 5 };
+    },
+  });
+  const r = await ensureGuard({ candidatePorts: [1, 2] }, d);
+  assert.equal(r.status, "launched");
+  assert.equal(r.port, 2);
+  assert.deepEqual(ports, [1, 2]);
 });
 
 /* ───────────── the launch lock ───────────── */
@@ -215,6 +274,17 @@ test("a guard still starting makes another one adopt it", async () => {
   const d = start(guardEnv(home, await reservePort(), "token-D"));
   assert.equal(await d.exitCode(), 0);
   assert.match(d.stderr(), /another guard is starting/);
+});
+
+test("a real guard missing from guard.json stops a launcher from starting another", async () => {
+  let launches = 0;
+  const r = await ensureGuard(
+    { candidatePorts: [await reservePort(), portA], lockPath: path.join(tmpRoot, "no-such-guard.json") },
+    { launch: async () => (launches++, { outcome: "failed" }) },
+  );
+  assert.equal(r.status, "unregistered");
+  assert.equal(r.port, portA);
+  assert.equal(launches, 0);
 });
 
 /* ───────────── the launcher believes only its own guard ───────────── */
