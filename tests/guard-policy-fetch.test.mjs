@@ -60,6 +60,7 @@ async function startGuard({ logDir, policyUrl, pubkey, refreshMs, extraEnv }) {
   fs.mkdirSync(logDir, { recursive: true });
   const env = {
     ...process.env,
+    HOME: fs.mkdtempSync(path.join(tmpRoot, "home-")), // never touch the live rendezvous lock
     VAIBOT_GUARD_HOST: "127.0.0.1",
     VAIBOT_GUARD_PORT: String(port),
     VAIBOT_GUARD_TOKEN: "fetch-token",

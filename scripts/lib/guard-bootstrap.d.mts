@@ -23,6 +23,15 @@ export interface GuardHealth {
   ok: boolean
   version: string | null
   instanceId?: string | null
+  /** Whether the guard accepts the token sent; null from a guard that predates the field. */
+  authorized?: boolean | null
+}
+
+/** Who holds the launch lock. A starting guard holds it as `daemon`. */
+export interface LaunchLockHolder {
+  pid: number
+  at: number
+  role?: 'launcher' | 'daemon'
 }
 
 export type LaunchResult =
@@ -41,9 +50,11 @@ export interface EnsureGuardDeps {
   readLock?: () => GuardLock | null
   writeLock?: (lock: GuardLock) => GuardLock
   health?: (host: string, port: number, token?: string) => Promise<GuardHealth | null>
-  launch?: (host: string, port: number, token: string) => Promise<LaunchResult>
+  launch?: (host: string, port: number, token: string, ctx?: { lockHeld: boolean }) => Promise<LaunchResult>
   acquireLock?: () => Promise<boolean>
   releaseLock?: () => Promise<void>
+  lockHolder?: () => LaunchLockHolder | null
+  alive?: (pid: number) => boolean
   genToken?: () => string
   now?: () => number
 }
@@ -51,6 +62,8 @@ export interface EnsureGuardDeps {
 export type EnsureGuardResult =
   | (GuardLock & { ok: true; status: 'reused' | 'launched' })
   | { ok: false; status: 'no-launcher' | 'launch-failed'; reason: string }
+  /** A guard is starting and holds the launch lock: adopt it, launch nothing. */
+  | { ok: false; status: 'starting'; pid: number; reason: string }
 
 /** Machine-wide containment state, as the guard writes it. */
 export interface Containment {
@@ -75,12 +88,21 @@ export function readContainment(file?: string): Containment
 /** Record containment for every breaker on the machine. Atomic, 0600, best-effort. */
 export function writeContainment(contained: boolean, reason?: string | null, file?: string): boolean
 
-/** Cross-process single-flight mutex via an O_EXCL lock file. True iff WE hold it. */
+/** True if a process with this pid exists. */
+export function pidAlive(pid: number): boolean
+/** Who holds the launch lock, or null. */
+export function launchLockHolder(path?: string): LaunchLockHolder | null
+/**
+ * Cross-process single-flight mutex via an O_EXCL lock file. True iff WE hold it.
+ * A live guard's (`daemon`) lock is never stolen; a dead holder's always is.
+ */
 export function acquireFileLock(
   path?: string,
-  opts?: { staleMs?: number; now?: () => number },
+  opts?: { staleMs?: number; now?: () => number; role?: 'launcher' | 'daemon'; alive?: (pid: number) => boolean },
 ): boolean
 export function releaseFileLock(path?: string): void
+/** Release the launch lock only if this process holds it. */
+export function releaseFileLockIfOurs(path?: string): void
 /** Blocking acquire; false means we gave up waiting and the caller proceeds best-effort. */
 export function defaultAcquireLock(
   opts?: { timeoutMs?: number; pollMs?: number; now?: () => number },

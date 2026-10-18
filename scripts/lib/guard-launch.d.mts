@@ -10,7 +10,7 @@ export function makeLauncher(cfg: {
   baseEnv?: Record<string, string>
   healthTimeoutMs?: number
   pollMs?: number
-}): (host: string, port: number, token: string) => Promise<LaunchResult>
+}): (host: string, port: number, token: string, ctx?: { lockHeld?: boolean }) => Promise<LaunchResult>
 
 export function ensureGuardDefault(
   opts: EnsureGuardOpts & {
